@@ -9,7 +9,7 @@
 set -euo pipefail
 
 DB_NAME="${DB_NAME:-demodb}"
-COLLECTION_NAME="${COLLECTION_NAME:-listings}"
+COLLECTION_NAME="${COLLECTION_NAME:-stays}"
 MONGODB_URI="${MONGODB_URI:-mongodb://demo:test@localhost:10260/?tls=true&tlsAllowInvalidCertificates=true}"
 
 MODE="${1:---all}"

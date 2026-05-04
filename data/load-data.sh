@@ -4,9 +4,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DATA_FILE="${SCRIPT_DIR}/embedded_data.json"
+DATA_FILE="${DATA_FILE:-${SCRIPT_DIR}/booking-agents_vectors.json}"
 DB_NAME="${DB_NAME:-demodb}"
-COLLECTION_NAME="${COLLECTION_NAME:-listings}"
+COLLECTION_NAME="${COLLECTION_NAME:-stays}"
 
 # Default to local connection
 MONGODB_URI="${MONGODB_URI:-mongodb://demo:test@localhost:10260/?tls=true&tlsAllowInvalidCertificates=true}"
@@ -69,8 +69,11 @@ mongosh "$MONGODB_URI" --eval "
   });
   print('Vector index created');
   
-  // Also create useful query indexes
-  db['$COLLECTION_NAME'].createIndex({ property_type: 1, price: 1, name: 1 });
+  // Also create useful query indexes for filter/sort demos
+  db['$COLLECTION_NAME'].createIndex({ property_type: 1, price: 1 });
+  db['$COLLECTION_NAME'].createIndex({ price: 1 });
+  db['$COLLECTION_NAME'].createIndex({ bedrooms: 1, beds: 1 });
+  db['$COLLECTION_NAME'].createIndex({ tags: 1 });
   print('Query indexes created');
   
   const count = db['$COLLECTION_NAME'].countDocuments();
