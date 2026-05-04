@@ -111,15 +111,17 @@ echo ""
 echo "=== Deploying DocumentDB instance ==="
 
 # Persist password across re-runs: store in a Secret on first deploy, reuse on subsequent runs.
+# Secret must have keys 'username' and 'password' for the DocumentDB operator.
 kubectl create namespace documentdb-ns --dry-run=client -o yaml | kubectl apply -f -
 
-if kubectl get secret docdb-demo-password -n documentdb-ns >/dev/null 2>&1; then
-  DOCDB_PASSWORD="$(kubectl get secret docdb-demo-password -n documentdb-ns -o jsonpath='{.data.password}' | base64 -d)"
-  echo "Reusing existing DocumentDB password from Secret docdb-demo-password."
+if kubectl get secret docdb-demo-credentials -n documentdb-ns >/dev/null 2>&1; then
+  DOCDB_PASSWORD="$(kubectl get secret docdb-demo-credentials -n documentdb-ns -o jsonpath='{.data.password}' | base64 -d)"
+  echo "Reusing existing DocumentDB credentials from Secret docdb-demo-credentials."
 else
   DOCDB_PASSWORD="${DOCDB_PASSWORD:-$(openssl rand -base64 16)}"
-  kubectl create secret generic docdb-demo-password \
+  kubectl create secret generic docdb-demo-credentials \
     --namespace documentdb-ns \
+    --from-literal=username=docdb \
     --from-literal=password="$DOCDB_PASSWORD"
 fi
 
@@ -133,18 +135,30 @@ spec:
   environment: eks
   nodeCount: 1
   instancesPerNode: 1
-  credential:
-    password: "$DOCDB_PASSWORD"
+  documentDbCredentialSecret: docdb-demo-credentials
   resource:
     storage:
       pvcSize: 20Gi
       storageClass: documentdb-storage
   exposeViaService:
     serviceType: LoadBalancer
-    serviceAnnotations:
-      service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
-      service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
 EOF
+
+# Patch the Service to use AWS NLB (operator no longer supports serviceAnnotations).
+# The Service is created by the operator; wait briefly and then annotate.
+echo "Waiting for DocumentDB Service to be created..."
+for i in {1..30}; do
+  SVC_NAME=$(kubectl get svc -n documentdb-ns -o jsonpath='{.items[?(@.spec.type=="LoadBalancer")].metadata.name}' 2>/dev/null | awk '{print $1}')
+  if [ -n "$SVC_NAME" ]; then
+    kubectl annotate svc -n documentdb-ns "$SVC_NAME" \
+      service.beta.kubernetes.io/aws-load-balancer-type=nlb \
+      service.beta.kubernetes.io/aws-load-balancer-scheme=internet-facing \
+      --overwrite
+    echo "Annotated Service '$SVC_NAME' for NLB."
+    break
+  fi
+  sleep 5
+done
 
 echo ""
 echo "=== EKS deployment complete ==="

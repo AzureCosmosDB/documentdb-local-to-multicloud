@@ -95,13 +95,14 @@ echo "=== Deploying DocumentDB instance ==="
 # Persist password across re-runs in a Secret on first deploy.
 kubectl create namespace documentdb-ns --dry-run=client -o yaml | kubectl apply -f -
 
-if kubectl get secret docdb-demo-password -n documentdb-ns >/dev/null 2>&1; then
-  DOCDB_PASSWORD="$(kubectl get secret docdb-demo-password -n documentdb-ns -o jsonpath='{.data.password}' | base64 -d)"
-  echo "Reusing existing DocumentDB password from Secret docdb-demo-password."
+if kubectl get secret docdb-demo-credentials -n documentdb-ns >/dev/null 2>&1; then
+  DOCDB_PASSWORD="$(kubectl get secret docdb-demo-credentials -n documentdb-ns -o jsonpath='{.data.password}' | base64 -d)"
+  echo "Reusing existing DocumentDB credentials from Secret docdb-demo-credentials."
 else
   DOCDB_PASSWORD="${DOCDB_PASSWORD:-$(openssl rand -base64 16)}"
-  kubectl create secret generic docdb-demo-password \
+  kubectl create secret generic docdb-demo-credentials \
     --namespace documentdb-ns \
+    --from-literal=username=docdb \
     --from-literal=password="$DOCDB_PASSWORD"
 fi
 
@@ -115,8 +116,7 @@ spec:
   environment: aks
   nodeCount: 1
   instancesPerNode: 1
-  credential:
-    password: "$DOCDB_PASSWORD"
+  documentDbCredentialSecret: docdb-demo-credentials
   resource:
     storage:
       pvcSize: 20Gi
