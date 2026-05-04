@@ -5,6 +5,9 @@ metadata:
   name: docdb-demo-eks
   region: us-west-2
   version: "1.33"
+  tags:
+    project: documentdb-local-to-multicloud
+    owner: mjbrown
 
 managedNodeGroups:
   - name: default

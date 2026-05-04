@@ -51,9 +51,8 @@ echo "=== Deploying EKS cluster ==="
 echo "Cluster: $CLUSTER_NAME"
 echo "Region: $REGION"
 
-# Create EKS cluster using eksctl with tags
-eksctl create cluster -f "$SCRIPT_DIR/cluster-config.yaml" \
-  --tags "owner=$OWNER,project=documentdb-local-to-multicloud"
+# Create EKS cluster using eksctl (tags are defined in cluster-config.yaml metadata)
+eksctl create cluster -f "$SCRIPT_DIR/cluster-config.yaml"
 
 # Update kubeconfig
 aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION"
