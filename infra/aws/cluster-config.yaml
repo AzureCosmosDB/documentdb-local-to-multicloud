@@ -4,7 +4,7 @@ kind: ClusterConfig
 metadata:
   name: docdb-demo-eks
   region: us-west-2
-  version: "1.31"
+  version: "1.33"
 
 managedNodeGroups:
   - name: default
