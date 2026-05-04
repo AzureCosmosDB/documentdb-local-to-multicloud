@@ -2,61 +2,119 @@
 
 **Time: ~4 minutes (pre-deployed, show results)**
 
-> **Pre-deploy before the session**: Run `infra/scripts/start.sh` → option 2
+> **Pre-deploy before the session**: same multi-cloud `start.sh` option 3 as
+> demo 04. The EKS cluster is the **WAL replica** of the AKS primary,
+> connected over an Istio multi-cluster mesh.
 
 ## What You'll Show
 
-1. Same operator, same Helm chart, different cloud
-2. DocumentDB running on EKS with NLB
-3. Connection string is identical pattern
+1. Same operator, same Helm chart, **literally the same DocumentDB CR** —
+   propagated to EKS by KubeFleet
+2. A WAL replica pod streaming changes from the AKS primary over Istio
+3. Reads against the EKS replica return the same data as the AKS primary
+4. The connection string pattern is identical to AKS
+
+## Cluster names
+
+| Context | Cluster | Region | Role today |
+|---|---|---|---|
+| `aws-documentdb` | EKS | us-west-2 | DocumentDB WAL replica |
+| `azure-documentdb` | AKS member | eastus2 | DocumentDB primary |
 
 ## Steps (during demo, cluster is already running)
 
-### 1. Switch Context
+### 1. Switch context and show the cluster
 
 ```bash
-kubectl config use-context eks-demo
+kubectl --context aws-documentdb get nodes
+kubectl --context aws-documentdb get documentdb,pods -n documentdb-preview-ns
+kubectl --context aws-documentdb get svc -n documentdb-preview-ns
 ```
 
-### 2. Show the Cluster
+Look for the `wal-replica` pod with an Istio sidecar:
+```bash
+kubectl --context aws-documentdb get pods -n documentdb-preview-ns \
+  -l component=wal-replica -o wide
+```
+
+### 2. Show the operator was propagated by Fleet
 
 ```bash
-kubectl get nodes
-kubectl get documentdb -n documentdb-ns
-kubectl get pods -n documentdb-ns
-kubectl get svc -n documentdb-ns
+kubectl --context hub get clusterresourceplacement -o wide
 ```
 
-### 3. Connect
+`documentdb-base` and `documentdb-crp` should both show `Synchronized=True`
+on every member — that is what got the operator + the CR onto EKS.
 
+### 3. Connect to the replica
+
+**Two ways** — same trade-off as AKS (see demo 04 for the "why"):
+
+**(a) Direct via NLB** — works for `mongosh`, occasionally flaky on first TLS
+handshake:
 ```bash
 mongosh "mongodb://docdb:<password>@<NLB-HOSTNAME>:10260/?tls=true&tlsAllowInvalidCertificates=true&authMechanism=SCRAM-SHA-256"
 ```
 
-### 4. Side-by-Side Comparison
-
-Show both terminals:
-- Left: AKS cluster (`kubectl config use-context aks-demo`)
-- Right: EKS cluster (`kubectl config use-context eks-demo`)
-
+**(b) Persistent port-forward (recommended for VS Code + reliable demos)**:
 ```bash
-# Same command, different cloud
-kubectl get documentdb -n documentdb-ns
+CONTEXT=aws-documentdb \
+NAMESPACE=documentdb-preview-ns \
+SERVICE=documentdb-service-documentdb-preview \
+LOCAL_PORT=12260 \
+infra/scripts/portforward.sh
 ```
 
-## Key Differences from AKS
+In **VS Code → DocumentDB extension → + Add Connection**:
+```
+mongodb://docdb:<password>@localhost:12260/?tls=true&tlsAllowInvalidCertificates=true&authMechanism=SCRAM-SHA-256
+```
+Label it `EKS — replica (port-fwd)`.
 
-| Aspect | AKS | EKS |
-|--------|-----|-----|
-| Storage class | managed-premium | gp3 |
-| Load balancer | Azure LB | AWS NLB |
-| Auth | Managed Identity | IAM Roles |
-| Deploy tool | Bicep + az CLI | eksctl |
-| **DocumentDB config** | **Identical** | **Identical** |
+> The deploy-documentdb.sh password may contain `/` and `=`; URL-encode them
+> if you embed the URI somewhere that doesn't tolerate raw chars
+> (`/` → `%2f`, `=` → `%3d`).
 
-## Talking Points
+### 4. Verify replication (no data load step on EKS!)
 
-- "Exact same Helm chart, exact same operator, exact same DocumentDB"
-- "Only the storage class and load balancer annotations change"
-- "Your application code is 100% unchanged"
-- "This is what open source + Kubernetes gives you: true portability"
+You did not run `load-data.sh` against EKS — it was never necessary, because
+the data streamed in from AKS via WAL.
+
+```javascript
+use demodb
+db.stays.countDocuments()                         // 1000 — same as AKS
+db.stays.find({ tags: { $all: ["downtown", "wifi"] } }).limit(5)
+```
+
+### 5. Side-by-side comparison
+
+Show two terminals or two VS Code DocumentDB tabs:
+- Left: `AKS — primary (port-fwd)` (writes go here)
+- Right: `EKS — replica (port-fwd)` (reads return identical data)
+
+```javascript
+// On AKS
+db.stays.insertOne({ _id: "replication-sentinel-1", note: "hello from AKS primary", ts: new Date() })
+
+// Wait ~2-5 seconds, then on EKS
+db.stays.findOne({ _id: "replication-sentinel-1" })
+```
+
+## Key differences from AKS (the only ones)
+
+| Aspect | AKS member | EKS member |
+|---|---|---|
+| Storage class | managed-csi (default) | `documentdb-storage` (gp3) |
+| Load balancer | Azure LB | AWS NLB (annotated internet-facing) |
+| Auth | Azure AD / Entra | IRSA (IAM roles for service accounts) |
+| **Operator + DocumentDB CR** | **Identical (propagated by Fleet)** | **Identical** |
+
+## Talking points
+
+- "Exact same Helm chart, exact same operator, exact same `DocumentDB` CR —
+  the only `clusterReplication.clusterList` entry that's different is the
+  `storageClass` override for EKS gp3."
+- "The replica is reading from the primary over an mTLS-secured Istio tunnel
+  between an AKS east-west gateway in eastus2 and an internet-facing NLB in
+  us-west-2."
+- "Your application code is 100% unchanged."

@@ -2,94 +2,117 @@
 
 **Time: ~5 minutes (pre-deployed, show results)**
 
-> **Pre-deploy before the session**: Run `infra/scripts/start.sh` → option 1
+> **Pre-deploy before the session**: `bash infra/scripts/start.sh` → option 3
+> (multi-cloud). The AKS member cluster is part of the AKS Fleet that runs the
+> primary DocumentDB. There is no longer a "AKS only" mode for the talk —
+> demos 04, 05, and 06 share one fleet-managed deployment.
 
 ## What You'll Show
 
-1. DocumentDB operator installed on AKS via Helm
-2. DocumentDB cluster running as a K8s custom resource
-3. External access via LoadBalancer
-4. Same connection string pattern
+1. The DocumentDB operator running on the AKS member cluster (propagated
+   from the Fleet hub via `ClusterResourcePlacement`)
+2. A `DocumentDB` custom resource on the AKS member acting as the **primary**
+3. External access via an Azure LoadBalancer in eastus2
+4. The same MongoDB connection string pattern as local
+
+## Cluster names
+
+| Context | Cluster | Region | Role today |
+|---|---|---|---|
+| `hub` | AKS Fleet hub | eastus2 | Control plane (no workloads) |
+| `azure-documentdb` | AKS member | eastus2 | DocumentDB **primary** |
+| `aws-documentdb` | EKS member | us-west-2 | DocumentDB WAL replica |
 
 ## Steps (during demo, cluster is already running)
 
-### 1. Show the Cluster
+### 1. Show the cluster
 
 ```bash
-# Show nodes
-kubectl get nodes
-
-# Show DocumentDB operator
-kubectl get pods -n documentdb-operator
-
-# Show DocumentDB instance
-kubectl get documentdb -n documentdb-ns
-kubectl get pods -n documentdb-ns
+kubectl --context azure-documentdb get nodes
+kubectl --context azure-documentdb get pods -n documentdb-operator
+kubectl --context azure-documentdb get documentdb,pods -n documentdb-preview-ns
 ```
 
-### 2. Show the Custom Resource
+### 2. Show the custom resource — note `clusterReplication`
 
 ```bash
-kubectl describe documentdb docdb-demo -n documentdb-ns
+kubectl --context azure-documentdb describe documentdb documentdb-preview \
+  -n documentdb-preview-ns
 ```
 
-### 3. Get Connection Info
+Point out:
+- `spec.clusterReplication.primary: azure-documentdb`
+- `spec.clusterReplication.crossCloudNetworkingStrategy: Istio`
+- The cluster list — AKS + EKS both listed
+
+### 3. Get connection info
 
 ```bash
-# Get external IP
-kubectl get svc -n documentdb-ns
+# External IP of the LoadBalancer
+kubectl --context azure-documentdb get svc -n documentdb-preview-ns
 
-# Get the auto-generated password
-kubectl get secret -n documentdb-ns docdb-demo-credentials -o jsonpath='{.data.password}' | base64 -d
+# The auto-generated password (set by deploy-documentdb.sh)
+kubectl --context azure-documentdb get secret documentdb-credentials \
+  -n documentdb-preview-ns -o jsonpath='{.data.password}' | base64 -d
 ```
 
 **Two ways to connect:**
 
-**(a) Direct via LoadBalancer** — works for `mongosh` from a clean shell, but the cloud LB sometimes drops the TLS handshake (LB health probes, session affinity, SNI mismatch on the gateway's self-signed `localhost` cert). Good for showing "this is a real public endpoint."
+**(a) Direct via LoadBalancer** — public endpoint, occasionally flaky on the
+TLS handshake (gateway uses self-signed `localhost` cert):
 ```bash
 mongosh "mongodb://docdb:<password>@<EXTERNAL-IP>:10260/?tls=true&tlsAllowInvalidCertificates=true&authMechanism=SCRAM-SHA-256"
 ```
 
-**(b) Persistent port-forward (recommended for VS Code + reliable demos)** — bypasses the LB, auto-reconnects if it drops:
+**(b) Persistent port-forward (recommended for VS Code + reliable demos)**:
 ```bash
-# Foreground, prints the connection URI on startup:
+CONTEXT=azure-documentdb \
+NAMESPACE=documentdb-preview-ns \
+SERVICE=documentdb-service-documentdb-preview \
+LOCAL_PORT=11260 \
 infra/scripts/portforward.sh
-
-# Or one-shot:
-kubectl port-forward -n documentdb-ns svc/documentdb-service-docdb-demo 11260:10260
 ```
-Then in **VS Code → DocumentDB extension → + Add Connection**, paste:
+
+In **VS Code → DocumentDB extension → + Add Connection**:
 ```
 mongodb://docdb:<password>@localhost:11260/?tls=true&tlsAllowInvalidCertificates=true&authMechanism=SCRAM-SHA-256
 ```
-Label it `AKS — docdb-demo (port-fwd)`.
+Label it `AKS — primary (port-fwd)`.
 
-> **Why port-forward?** Self-signed cert on the gateway + Azure LB session
-> behavior makes the public TLS path flaky. Port-forward is one terminal away
-> and just works. `infra/scripts/portforward.sh` keeps the tunnel alive across
-> drops so you don't have to babysit it during a talk.
+### 4. Load the dataset (one-time, before the talk)
 
-### 4. Show Same Data
+Load on the **primary only** — the EKS replica picks it up via WAL streaming.
 
-```javascript
-// Import same dataset
-// Run same queries
-// Same results as local
-db.listings.find({ property_type: "Apartment" }).limit(3)
+```bash
+MONGODB_URI="mongodb://docdb:<password>@localhost:11260/?tls=true&tlsAllowInvalidCertificates=true&authMechanism=SCRAM-SHA-256" \
+  ./data/load-data.sh
 ```
 
-## How It Was Deployed
+### 5. Show the data
 
-Walk through `infra/azure/deploy.sh`:
-1. Bicep template creates AKS cluster
-2. cert-manager installed (required by operator)
-3. DocumentDB operator installed via Helm
-4. DocumentDB custom resource applied
-5. LoadBalancer exposes the service
+```javascript
+use demodb
+db.stays.countDocuments()                         // 1000
+db.stays.find({ property_type: "Entire home/apt" }).limit(3)
+db.stays.find({ tags: { $all: ["downtown", "wifi"] } }).limit(5)
+```
 
-## Talking Points
+## How it was deployed
 
-- "Same DocumentDB, now on Kubernetes"
-- "Operator manages lifecycle — scaling, backups, failover"
-- "Helm chart makes installation a one-liner"
-- "Your app code doesn't change — same MongoDB connection string"
+Walk through `infra/multi-cloud/deploy.sh`:
+1. Bicep deploys the AKS Fleet + the AKS member in eastus2
+2. EKS is created in parallel via eksctl
+3. EKS joins the Fleet via the open-source kubefleet bootstrap
+4. cert-manager + Istio multi-cluster mesh (shared root CA, east-west gateways)
+5. DocumentDB operator installed on the **hub**, propagated to members via
+   `ClusterResourcePlacement` (so the operator binary is identical everywhere)
+6. `deploy-documentdb.sh` applies the `DocumentDB` CR + propagation policy
+
+## Talking points
+
+- "Same DocumentDB, now on Kubernetes — and propagated by Fleet to every
+  member of the mesh."
+- "Operator manages lifecycle — scaling, backups, **failover**."
+- "The application's connection string is the only thing that changes
+  between local and cloud — the queries don't."
+- "The AKS member is the primary today, but I'll flip that on stage in demo 06."
