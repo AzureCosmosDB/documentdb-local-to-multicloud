@@ -186,9 +186,10 @@ In the extension, open **Index Advisor** (or the equivalent insights/advisor UI)
 
 ## 9) Run the same demo against AKS (cloud)
 
-Once `infra/azure/deploy.sh` has stood up the AKS cluster + DocumentDB instance
-(see [demo/04-aks/README.md](../demo/04-aks/README.md)), you can connect the
-VS Code DocumentDB extension to it and run the exact same queries as local.
+Once `infra/multi-cloud/deploy.sh` + `deploy-documentdb.sh` have stood up the
+fleet (see [demo/04-aks/README.md](../demo/04-aks/README.md) for the full
+walk-through), you can connect the VS Code DocumentDB extension to the AKS
+primary and run the exact same queries as local.
 
 ### Why a port-forward (and not the public IP)?
 
@@ -199,29 +200,63 @@ some clients stumble on the SNI mismatch). A `kubectl port-forward` skips the
 LB entirely and gives you a clean, reliable tunnel — which is what the VS Code
 extension wants.
 
-You only need to do this if you want to drive the cloud instance from your
-laptop. Apps running *inside* the cluster don't need it.
+You only need this if you want to drive the cloud instance from your laptop.
+Apps running *inside* the cluster don't need it.
 
 ### Start a persistent port-forward
 
 ```bash
+CONTEXT=azure-documentdb \
+NAMESPACE=documentdb-preview-ns \
+SERVICE=documentdb-service-documentdb-preview \
+LOCAL_PORT=11260 \
 infra/scripts/portforward.sh
 ```
 
 This:
-- Reads the username/password from the `docdb-demo-credentials` secret
+- Reads the username/password from the `documentdb-credentials` secret
 - Prints a ready-to-paste `mongodb://...@localhost:11260/...` URI
 - Auto-restarts the tunnel if it drops (laptop sleep, idle timeout, pod
   restart) so you don't have to babysit it during a talk
 
-Leave the terminal running. `Ctrl+C` to stop. Override `CONTEXT`,
-`NAMESPACE`, `LOCAL_PORT`, etc. via env vars if needed.
+Leave the terminal running. `Ctrl+C` to stop.
 
 ### Add the connection in VS Code
 
 1. **DocumentDB extension → + Add Connection**
 2. Paste the URI printed by `portforward.sh`
-3. Label it `AKS — docdb-demo (port-fwd)`
+3. Label it `AKS — primary (port-fwd)`
 
 You can now run the same queries from sections 4–7 against the cloud instance.
+
+## 10) Multi-cloud HA + failover
+
+```bash
+# Open a second terminal for the EKS replica
+CONTEXT=aws-documentdb \
+NAMESPACE=documentdb-preview-ns \
+SERVICE=documentdb-service-documentdb-preview \
+LOCAL_PORT=12260 \
+infra/scripts/portforward.sh
+```
+
+In VS Code, add a second connection labeled `EKS — replica (port-fwd)`.
+Both should show 1000 docs in `demodb.stays` even though `data/load-data.sh`
+only ran against AKS — that's WAL replication doing its job.
+
+Insert a sentinel doc on AKS, watch it appear on EKS within a couple of
+seconds. Then fail over:
+
+```bash
+kubectl documentdb promote \
+  --documentdb documentdb-preview \
+  --namespace documentdb-preview-ns \
+  --hub-context hub \
+  --target-cluster aws-documentdb \
+  --cluster-context aws-documentdb
+```
+
+Now writes go to EKS and AKS becomes the replica. Promote back with the
+mirror command. Full walk-through:
+[demo/06-multicloud/README.md](../demo/06-multicloud/README.md).
 

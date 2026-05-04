@@ -99,54 +99,42 @@ python scripts/query_examples.py
 python scripts/vector_restaurants_demo.py --query "romantic Italian dinner" --mode compact --k 10
 ```
 
-### Phase 3: Deploy to AKS (Azure)
+### Phase 3: Multi-cloud (AKS Fleet + AKS member + EKS member)
+
+The talk uses the upstream `documentdb-playground/multi-cloud-deployment`
+setup vendored into `infra/multi-cloud/`. It gives **real cross-cloud
+replication** — one DocumentDB CR, propagated to both clusters by KubeFleet,
+streaming WAL between Azure and AWS over an Istio multi-cluster mesh.
 
 ```bash
-# Login to Azure
+# Sign into both clouds
 az login
+aws sso login
 
-# Deploy AKS + DocumentDB operator + instance + load data + wipe indexes
-bash infra/azure/deploy.sh
+# Stand up Fleet hub + AKS + EKS + Istio + operator (~25-35 min)
+bash infra/multi-cloud/deploy.sh
+
+# Deploy DocumentDB across the mesh (auto-generates a password; save it)
+bash infra/multi-cloud/deploy-documentdb.sh
 ```
 
 This will:
-1. Create resource group `docdb-demo-rg` in `eastus2`
-2. Deploy AKS cluster via Bicep
-3. Install cert-manager + DocumentDB operator via Helm
-4. Deploy DocumentDB instance with LoadBalancer
-5. Wait for external IP
-6. Load 1,000 listings with vector embeddings
-7. Wipe indexes (data stays, ready for Index Advisor demo)
+1. Create Azure RG `docdb-multicloud-rg` in `eastus2`
+2. Deploy AKS Fleet `aks-fleet-hub-fleet` + AKS member `azure-documentdb` via Bicep
+3. Create EKS cluster `aws-documentdb` in `us-west-2` via eksctl, with EBS CSI driver and AWS LB controller
+4. Join EKS to the AKS Fleet via the kubefleet bootstrap
+5. Install cert-manager on every cluster
+6. Install Istio 1.24 multi-cluster mesh with shared root CA + east-west gateways + cross-cluster remote secrets
+7. Annotate the EKS east-west gateway with internet-facing NLB tags
+8. Install the DocumentDB operator on the hub; propagate CRDs/RBAC to members via `ClusterResourcePlacement`
+9. (`deploy-documentdb.sh`) Apply the `DocumentDB` CR + propagation policy; AKS becomes the primary, EKS becomes the WAL replica
 
-**Estimated time:** 15-20 minutes
-**Estimated cost:** ~$17/day ($512/month) while running
+**Estimated time:** 25-35 minutes for `deploy.sh`, ~5 minutes for `deploy-documentdb.sh`
+**Estimated cost:** ~$13/day while running (see `infra/multi-cloud/README.md`)
 
-### Phase 4: Deploy to EKS (AWS)
-
-```bash
-# Configure AWS CLI (or 'aws sso login' if your account uses IAM Identity Center)
-aws configure
-
-# Deploy EKS + DocumentDB operator + instance + load data + wipe indexes
-bash infra/aws/deploy.sh
-```
-
-This will:
-1. Create EKS cluster via eksctl
-2. Install EBS CSI driver + cert-manager + DocumentDB operator
-3. Deploy DocumentDB instance with NLB
-4. Wait for NLB hostname
-5. Load 1,000 listings with vector embeddings
-6. Wipe indexes (data stays, ready for Index Advisor demo)
-
-**Estimated time:** 20-25 minutes
-**Estimated cost:** ~$5-8/day ($140-230/month) while running
-
-The script is **idempotent** — re-running it skips cluster creation if it already exists, upgrades the helm release in place, and reuses the password stored in the `docdb-demo-password` Secret.
-
-### Phase 5: Multi-Cloud (both clusters)
-
-Use `infra/scripts/start.sh` → option 3 to verify both clusters are running, or deploy individually using Phases 4 and 5.
+Single-cluster fallbacks (`infra/azure/deploy.sh`, `infra/aws/deploy.sh`) are
+still available if you want a one-cloud-at-a-time demo, but the talk targets
+the multi-cloud stack.
 
 ---
 
@@ -157,11 +145,12 @@ Always tear down clusters when you're done — EKS in particular continues billi
 ### Full teardown (recommended after the event)
 
 ```bash
-# AWS (deletes EKS cluster and all dependencies, ~10-12 min)
-bash infra/aws/cleanup.sh
+# Multi-cloud stack (Fleet + AKS + EKS + Istio)
+bash infra/multi-cloud/cleanup.sh -y --wait
 
-# Azure (deletes the entire docdb-demo-rg resource group)
-bash infra/azure/cleanup.sh
+# Or, if you used the standalone deploys:
+bash infra/aws/cleanup.sh        # EKS only
+bash infra/azure/cleanup.sh      # AKS only
 
 # Stop the local Docker container
 docker rm -f docdb
@@ -180,6 +169,7 @@ aws cloudformation list-stacks --region us-west-2 --query "StackSummaries[?conta
 aws eks list-clusters --region us-west-2
 
 # Azure
+az group exists --name docdb-multicloud-rg
 az group exists --name docdb-demo-rg
 ```
 
@@ -191,14 +181,10 @@ Run this the morning of the presentation:
 
 - [ ] Docker Desktop is running
 - [ ] Local DocumentDB container is up: `docker start docdb`
-- [ ] AKS cluster is running: `bash infra/scripts/start.sh` → option 1
-- [ ] EKS cluster is running: `bash infra/scripts/start.sh` → option 2
-- [ ] VS Code extension connected to local instance
-- [ ] OpenAI API key in `.env`
-- [ ] Test vector search works locally
-- [ ] Verify AKS external IP: `kubectl --context aks-demo get svc -n documentdb-ns`
-- [ ] Verify EKS NLB hostname: `kubectl --context eks-demo get svc -n documentdb-ns`
-- [ ] Both clusters have data loaded (check document counts)
+- [ ] Multi-cloud stack is up: `bash infra/scripts/start.sh` → option 3
+- [ ] AKS primary reachable: `kubectl --context azure-documentdb get svc -n documentdb-preview-ns`
+- [ ] EKS replica reachable: `kubectl --context aws-documentdb get svc -n documentdb-preview-ns`
+- [ ] Both clusters return same `db.stays.countDocuments()` (1000)
 - [ ] Indexes wiped on local instance (for live Index Advisor demo)
 - [ ] Presentation deck open
 - [ ] GitHub repo open in browser (for audience to follow)
@@ -220,7 +206,7 @@ bash infra/scripts/stop.sh
 
 ```bash
 bash infra/scripts/start.sh
-# Option 3: Start both clusters
+# Option 3: Multi-cloud (Fleet + AKS + EKS)
 ```
 
 ### Destroy everything after the event
@@ -260,9 +246,9 @@ All scripts default to local connection. Set `MONGODB_URI` for AKS/EKS targets.
 | 01 - Local dev | 5 min | Docker running | Connect VS Code, import data, run queries |
 | 02 - Vector search | 12 min | Data loaded, indexes wiped | Create vector index, run semantic search, Index Advisor |
 | 03 - CI/CD | 3 min | GitHub Actions configured | Show workflow file, explain, show passing run |
-| 04 - AKS | 5 min | Cluster deployed, data loaded | Show kubectl, connect, run queries |
-| 05 - EKS | 4 min | Cluster deployed, data loaded | Switch context, side-by-side comparison |
-| 06 - Multi-cloud | 5 min | Both clusters running | Show replication, simulate failover |
+| 04 - AKS | 5 min | Multi-cloud stack deployed, data loaded on AKS primary | Show kubectl, connect, run queries |
+| 05 - EKS | 4 min | Same stack — EKS is the WAL replica | Switch context, show identical data via replication |
+| 06 - Multi-cloud | 5 min | Fleet+Istio mesh up, replication healthy | Insert sentinel doc, `kubectl documentdb promote` failover |
 
 ---
 

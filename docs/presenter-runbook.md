@@ -1,206 +1,276 @@
 # Presenter runbook (60-minute flow)
 
-This is a timing-oriented checklist aligned to the slide deck.
+Timing-oriented checklist aligned to the slide deck. **All examples use the
+booking dataset (`demodb.stays`, 1,000 short-term-rental listings with 1536-dim
+`text-embedding-3-small` vectors).**
+
+> Quick mental model: the same `demodb.stays` collection is loaded in
+> **local Docker → AKS → EKS** so the same queries work everywhere. Only the
+> connection string changes.
 
 ## Pre-demo checklist
 
-- DocumentDB extension installed
-- Mongoshell installed
-- Docker Desktop running
-- GitHub repo opened for CI slide
-- Provisioned AKS cluster in Azure and EKS cluster in AWS
-- kubectl contexts ready for AKS/EKS (or use screenshots)
+- [ ] DocumentDB VS Code extension installed
+- [ ] `mongosh` on PATH
+- [ ] Docker Desktop running
+- [ ] GitHub repo opened (for the CI/CD slide)
+- [ ] Multi-cloud stack up (`infra/multi-cloud/deploy.sh` + `deploy-documentdb.sh`)
+      and the booking dataset loaded on the AKS primary (it replicates to EKS)
+- [ ] Persistent port-forward tunnels running for both clusters
+  (see `infra/scripts/portforward.sh` — defaults below)
+- [ ] `OPENAI_API_KEY` exported in the shell you'll use for the vector demo
+- [ ] kubectl contexts `azure-documentdb`, `aws-documentdb`, and `hub` configured
+
+### Connection strings (paste-ready)
+
+| Where | Connection string |
+|---|---|
+| Local Docker | `mongodb://demo:demo@localhost:27017/?tls=true&tlsAllowInvalidCertificates=true&authMechanism=SCRAM-SHA-256` |
+| AKS primary (port-fwd) | `mongodb://default_user:<PASSWORD>@localhost:11260/?tls=true&tlsAllowInvalidCertificates=true&authMechanism=SCRAM-SHA-256` |
+| EKS replica (port-fwd) | `mongodb://default_user:<PASSWORD>@localhost:12260/?tls=true&tlsAllowInvalidCertificates=true&authMechanism=SCRAM-SHA-256` |
+
+> Both clusters share the same DocumentDB credentials (one CR, one secret —
+> Fleet propagates it). Get them with:
+> `kubectl --context azure-documentdb -n documentdb-preview-ns get secret documentdb-credentials -o jsonpath='{.data.password}' | base64 -d`
+
+> **Why port-forward for cloud clusters?** The gateway sidecar uses a self-signed
+> cert with `CN=localhost`. The cloud LBs (Azure LB, AWS NLB) make the public
+> TLS path flaky on first handshake. Port-forward bypasses the LB and just
+> works. Run `infra/scripts/portforward.sh` (auto-restarts on drop, prints the
+> ready URI). For EKS: `CONTEXT=eks-demo LOCAL_PORT=12260 ./portforward.sh`.
+
+---
 
 ## Live demo script
 
 ### A) Local start (2–3 min)
 
-- open docker-compose.yml
-- point out the location of the document db image
-- point out the data loading
+Show `docker-compose.yml`, then:
 
 ```bash
 docker compose up -d
+docker ps
 ```
 
-Show:
+Talking points:
+- Same image used in CI (next demo) and Kubernetes (later demos)
+- Port `27017` mapped to the gateway's `10260`
+- TLS on by default — `tlsAllowInvalidCertificates=true` for the demo cert
 
-- `docker ps`
-- port `27017`
-- connection string `mongodb://demo:demo@localhost:27017/?tls=true&tlsAllowInvalidCertificates=true`
+Then load the booking dataset (idempotent — skip if already loaded):
+
+```bash
+MONGODB_URI="mongodb://demo:demo@localhost:27017/?tls=true&tlsAllowInvalidCertificates=true" \
+  ./data/load-data.sh
+```
+
+Result: `demodb.stays` with 1,000 documents, vector index, and four query indexes.
 
 ### B) VS Code connection (2–4 min)
 
-Show:
+In the **DocumentDB** panel:
 
-- DocumentDB panel
-- New connection → `mongodb://demo:demo@localhost:27017/?tls=true&tlsAllowInvalidCertificates=true`
+1. **+ Add Connection** → paste the local connection string above
+2. Label it `Local — docdb`
+3. Expand `demodb` → `stays`
+
+Highlight: same UX you'll use against the cloud clusters in section I.
 
 ### C) Data import + exploration (5 min)
 
-The demo data is seeded automatically when you run `docker compose up -d`:
+In the extension, open `demodb.stays`. Toggle:
 
-- `foodservice.restaurants` is loaded from `data/restaurants.json`
-- `foodservice.restaurants_vectors` is loaded from `data/restaurants_vectors.json`
-- seeding runs only if the target collection is empty
+- **JSON view** — show document shape (`name`, `price`, `amenities`, `tags`,
+  `descriptionVector`, `search_text`)
+- **Tree view** — expand the `amenities` array
+- **Table view** — sort by `price`
 
-In VS Code, expand `foodservice` → `restaurants` and refresh to confirm documents are present.
-Also check `restaurants_vectors` is present (used later for vector search).
-
-Show:
-
-- JSON view vs Tree view vs Table view
+Talking point: `descriptionVector` is a 1536-dim embedding of `search_text`
+generated with **OpenAI `text-embedding-3-small`**. Queries at runtime must
+use the same model.
 
 ### D) Query editor (4 min)
 
-- Navigate to foodservice, restaurants, Documents
-- Show JSON view
-- Click Gear
-- Type the following in filter and project
+Right-click `stays` → **Find** (or open the Documents view). Click the gear
+and paste:
 
+**Filter:**
 ```json
-{ "cuisine": "Japanese" }
-
-{ "_id": 0, "name": 1 }
+{ "property_type": "Entire home/apt", "price": { "$lt": 200 } }
 ```
 
-- Run query
-- Add a sort key
-
+**Project:**
 ```json
-{ "name": 1  }
+{ "_id": 0, "name": 1, "price": 1, "bedrooms": 1 }
 ```
 
-- Should look like this
+**Sort:**
+```json
+{ "price": 1 }
+```
 
-[](../media/document_db_extension_query.png)
+Run. Show the results pane.
 
-### E) Mongoshell (3 minutes)
+### E) Mongoshell (3 min)
 
-Start mongoshell by right clicking on demo@localhost:27017
+Right-click the connection → **Launch Shell**:
 
 ```javascript
-// Find all Italian restaurants
-use foodservice
+use demodb
 
-db.restaurants.find({ cuisine: "Italian" })
+// Find entire homes under $200
+db.stays.find(
+  { property_type: "Entire home/apt", price: { $lt: 200 } },
+  { name: 1, price: 1, bedrooms: 1 }
+).limit(5)
 
-// Projection
-db.restaurants.find(
-  { cuisine: "Italian" },
-  { name: 1, address: 1 }
-)
+// Tag-based filter (multikey index on `tags`)
+db.stays.find(
+  { tags: { $all: ["downtown", "wifi"] } },
+  { name: 1, tags: 1, price: 1 }
+).limit(5)
 
-// Operator query
-db.restaurants.find({ "reviews.rating": { $gte: 5 } })
-
-// Aggregation pipeline
-// (zip code distribution)
-db.restaurants.aggregate([
-  { $match: { cuisine: "Italian" } },
-  { $group: { _id: "$address.zipcode", count: { $sum: 1 } } },
-  { $sort: { count: -1 } }
+// Aggregation: avg price per property type
+db.stays.aggregate([
+  { $group: { _id: "$property_type", avgPrice: { $avg: "$price" }, n: { $sum: 1 } } },
+  { $sort: { avgPrice: -1 } }
 ])
 ```
 
 ### F) Indexing (4–6 min)
 
-Start the interactive query/index demo tool:
+Show that the loader already created useful indexes:
 
-```powershell
-# Activate the venv (PowerShell)
-.\.venv\Scripts\Activate.ps1
-
-# If your venv is activated
-python .\scripts\query_examples.py
+```javascript
+db.stays.getIndexes()
+// _id_, vectorSearchIndex, property_type_1_price_1, price_1, bedrooms_1_beds_1, tags_1
 ```
 
-What the tool prints for each demo (2–6):
+Demo before/after on a query the indexes do **not** cover:
 
-- `Query:` the Mongo-style query text it will run
-- `Sample results:` a few example documents/rows (printed once, before timings)
-- `Explain (before index)` / `Explain (after index)`: a stable summary of the winning plan (`COLLSCAN` vs `IXSCAN` and the chosen `indexName`)
-- `Elapsed (before index)` / `Elapsed (after index)`: average + best timing over repeats
-- `Creating index: ...`: the index definition the demo adds
+```javascript
+// 1) No supporting index — COLLSCAN
+db.stays.find({ bathrooms: { $gte: 3 }, price: { $lt: 400 } }).explain("executionStats")
 
-Menu items:
+// 2) Add a compound index
+db.stays.createIndex({ bathrooms: 1, price: 1 })
 
-- `1) Show document count / connection check`
-- Shows the connection is working and prints an estimated doc count.
+// 3) Re-run — IXSCAN, far fewer docs examined
+db.stays.find({ bathrooms: { $gte: 3 }, price: { $lt: 400 } }).explain("executionStats")
+```
 
-- `2) Find: cuisine covered projection → create { cuisine: 1 }`
-- Demonstrates a covered query (index-only read): filter on `cuisine` and project only `cuisine`.
-- What you’ll see: `COLLSCAN → IXSCAN` after creating `idx_cuisine_1`, plus a noticeable time drop.
-
-- `3) Count: cuisine count_documents → create { cuisine: 1 }`
-- Counts documents for a (rare) cuisine value. This is often the most dramatic improvement.
-- What you’ll see: `COLLSCAN → IXSCAN` after creating `idx_cuisine_1`, plus a big time drop.
-
-- `4) Find: cuisine + sort by name + limit → create { cuisine: 1, name: 1 }`
-- Demonstrates a compound index that supports filter + sort + limit.
-- What you’ll see: `COLLSCAN → IXSCAN` after creating `idx_cuisine_name_1`, typically faster results.
-
-- `5) Find: tags $all (array field) count_documents → create { tags: 1 } (multikey)`
-- Demonstrates a multikey index on an array field using a selective `tags: { $all: [...] }` predicate.
-- What you’ll see: `COLLSCAN → IXSCAN` after creating `idx_tags_1`, with a modest-to-clear speedup.
-
-- `6) Aggregate: match cuisine (rare) + group by zipcode → create { cuisine: 1, 'address.zipcode': 1 }`
-- Demonstrates indexing an aggregation pipeline’s initial `$match` and grouping on a nested field.
-- What you’ll see: `COLLSCAN → IXSCAN` after creating `idx_cuisine_zipcode_1`, typically faster pipeline.
-
-- `r) Reset indexes (drop all non-_id indexes)`
-- Drops any demo-created indexes to return to a clean state.
-- What you’ll see: `Reset indexes: dropped N index(es)`.
-
-- `q) Quit`
-- Exits the tool.
+Compare `executionStats.executionTimeMillis` and `totalDocsExamined` before
+and after.
 
 ### G) Vector search (5–6 min)
 
-- Return to DocumentDB Extension
-- Open foodservice, restaurants_vectors, Documents
-- Click Json
-- Explore the data
+Show the index that ships with the dataset:
 
-Option 1 (quick smoke demo, products dataset):
-
-```powershell
-python .\scripts\vector_demo.py --uri "mongodb://demo:demo@localhost:27017/?tls=true&tlsAllowInvalidCertificates=true"
+```javascript
+db.stays.getIndexes().filter(i => i.name === "vectorSearchIndex")
+// HNSW, cosine similarity, 1536 dim, on `descriptionVector`
 ```
 
-Option 2 (talk-friendly, restaurants dataset + score threshold):
+Run a semantic search using a prebuilt embedding (avoids needing OpenAI live):
 
-```powershell
-python .\scripts\vector_restaurants_demo.py --uri "mongodb://demo:demo@localhost:27017/?tls=true&tlsAllowInvalidCertificates=true" --query "cozy romantic date night pasta" --mode compact --filter-on cosine --k 20 --min-score 0.8
+```bash
+# In a Python REPL or scratch script
+python - <<'PY'
+import os, json
+from openai import OpenAI
+from pymongo import MongoClient
+
+oai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+emb = oai.embeddings.create(
+    model="text-embedding-3-small",
+    input="cozy downtown loft with hot tub and fast wifi for remote work"
+).data[0].embedding
+
+m = MongoClient("mongodb://demo:demo@localhost:27017/?tls=true&tlsAllowInvalidCertificates=true")
+results = m["demodb"]["stays"].aggregate([
+    {"$search": {"cosmosSearch": {
+        "vector": emb, "path": "descriptionVector", "k": 5
+    }, "returnStoredSource": True}},
+    {"$project": {"_id": 0, "name": 1, "price": 1,
+                  "score": {"$meta": "searchScore"}}}
+])
+for r in results:
+    print(f"{r['score']:.4f}  ${r['price']}/night  {r['name']}")
+PY
 ```
 
-Notes:
-
-- This demo uses a single `vectorEmbedding` field in `foodservice.restaurants_vectors`.
-- Use `--mode compact` for high cosine similarity (score-threshold demos). Use `--mode rich` for structured queries like "italian manhattan 10001".
-- This is a separate collection from `foodservice.restaurants`, so it won’t interfere with the compound-index / Indexing demo.
-
-Show:
-
-- index creation command
-- `$search` with `cosmosSearch`
-- ranked results with `searchScore` and computed cosine similarity
+Talking points:
+- Same query embedded with `text-embedding-3-small` (must match the corpus)
+- HNSW index on `descriptionVector`, cosine similarity
+- Results ranked by `searchScore`
 
 ### H) CI/CD slide (3–5 min)
 
-Show workflow file:
+Open `.github/workflows/ci.yml`:
 
-- `.github/workflows/ci.yml`
-- emulator service container
+- DocumentDB runs as a **service container** alongside the test job
+- Tests use `MONGODB_URI` — same env var as local + scripts
+- Push → test against real DocumentDB → no cloud cost
 
-### I) Kubernetes + multi-cloud slides (optional)
+### I) Kubernetes + multi-cloud (live, ~10 min)
 
-If no clusters are available live, use:
+Now the punchline: **one DocumentDB instance, two clouds, real replication, one
+command to fail over.**
 
-- manifests under `k8s/` as walkthrough material
-- screenshots/recordings for install + status checks
+**Switch the VS Code connection** from `Local — docdb` to
+`AKS — primary (port-fwd)`. Repeat the section E queries — identical results
+to the local container.
+
+```bash
+# Terminal split — show both clusters and the Fleet hub
+kubectl --context hub              get documentdb -n documentdb-preview-ns
+kubectl --context azure-documentdb get pods       -n documentdb-preview-ns
+kubectl --context aws-documentdb   get pods       -n documentdb-preview-ns
+```
+
+Point out: AKS pod is `documentdb-preview-1` (primary), EKS pod has label
+`component=wal-replica` — streaming WAL via the Istio east-west gateways.
+
+```javascript
+// Connected to AKS via port-forward on localhost:11260
+use demodb
+db.stays.countDocuments()                    // 1000
+db.stays.insertOne({ _id: "sentinel-talk", at: new Date() })
+
+// Switch the VS Code connection to EKS (port-forward localhost:12260)
+use demodb
+db.stays.countDocuments()                    // 1000 — replicated from AKS
+db.stays.find({ _id: "sentinel-talk" })      // shows up within ~2s
+```
+
+**Then fail over live:**
+
+```bash
+kubectl documentdb promote \
+  --documentdb documentdb-preview \
+  --namespace  documentdb-preview-ns \
+  --hub-context hub \
+  --target-cluster aws-documentdb \
+  --cluster-context aws-documentdb
+```
+
+EKS becomes primary, AKS becomes replica. Insert another doc on EKS, see it
+appear on AKS. Promote back if time permits.
+
+Talking points:
+- **Same operator, same chart, same DocumentDB** — driven by Azure Fleet Manager
+- **Real WAL replication** over an Istio multi-cluster mesh (mTLS, east-west GW)
+- **One command** to fail over — no DNS swap, no app config change required
+- Application code: zero changes
+
+---
 
 ## Fallbacks
 
-- If port `27017` is busy, change it in `docker-compose.yml` and use that in the connection string.
-- If the extension misbehaves, use scripts as a backup.
+- If port `27017` is busy, edit `docker-compose.yml` and adjust the URI.
+- If a port-forward tunnel drops mid-demo, `infra/scripts/portforward.sh`
+  auto-restarts within ~2s.
+- If the cloud LBs *do* hold the TLS handshake on the day, you can demo the
+  raw external IP/hostname — but the safe path is the port-forward.
+- If the VS Code extension misbehaves, mongoshell does the same job from a
+  terminal split.

@@ -96,49 +96,55 @@ python scripts/generate_restaurants.py --count 5000 --hot-count 1000 --hot-cuisi
 
 ## Multi-Cloud Deployment
 
-> **Shell on Windows**: run these scripts from **Git Bash** or **WSL**. PowerShell is fine for the docker compose / Python steps above, but the deploy/cleanup scripts call bash directly.
+> **Shell on Windows**: run these scripts from **Git Bash**. WSL has DNS issues with `login.microsoftonline.com`. PowerShell is fine for the docker compose / Python steps above, but the deploy/cleanup scripts call bash directly.
 
-### Azure (AKS)
+The talk now uses the upstream `documentdb-playground/multi-cloud-deployment`
+setup (vendored into [`infra/multi-cloud/`](infra/multi-cloud/README.md)) which
+gives **real cross-cloud replication** instead of two unrelated clusters:
+
+- **AKS Fleet hub** in eastus2 (KubeFleet control plane)
+- **AKS member** in eastus2 (DocumentDB primary by default)
+- **EKS member** in us-west-2 (WAL replica)
+- **Istio multi-cluster mesh** with shared root CA + east-west gateways for
+  cross-cloud service discovery and mTLS-encrypted WAL replication
 
 ```bash
-# Sign in once
+# Sign in
 az login
-
-# Deploy AKS + cert-manager + DocumentDB operator + instance + load data
-bash infra/azure/deploy.sh
-
-# Tear it all down (asks for confirmation; pass --yes to skip)
-bash infra/azure/cleanup.sh
-```
-
-### AWS (EKS)
-
-```bash
-# Sign in once (uses your SSO start URL — see SETUP.md)
 aws sso login
 
-# Deploy EKS + cert-manager + DocumentDB operator + instance + load data
-bash infra/aws/deploy.sh
+# Stand up the whole stack (Fleet hub + AKS + EKS + Istio + operator). ~25-35 min.
+bash infra/multi-cloud/deploy.sh
 
-# Tear it all down (asks for confirmation; pass --yes to skip)
-bash infra/aws/cleanup.sh
+# Deploy a DocumentDB cluster across the mesh.
+bash infra/multi-cloud/deploy-documentdb.sh
+
+# Tear it all down.
+bash infra/multi-cloud/cleanup.sh -y --wait
 ```
 
-Both `deploy.sh` scripts are **idempotent** — safe to re-run. They skip cluster creation if the cluster already exists, use `helm upgrade --install` for the operator, and persist the generated DocumentDB password in a Kubernetes Secret so subsequent runs reuse it.
+See [`infra/multi-cloud/README.md`](infra/multi-cloud/README.md) for env-var
+configuration (e.g. `INCLUDE_GKE=true` for a third leg, `PRIMARY_CLUSTER=...`
+to start with EKS as primary).
+
+The standalone single-cluster deploys are still in `infra/azure/` and
+`infra/aws/` for anyone who wants the simpler "one cloud at a time" demo, but
+the talk and `demo/04-aks` / `demo/05-eks` / `demo/06-multicloud` runbooks
+target the multi-cloud stack.
 
 ### Cost Management
 
 ```bash
 bash infra/scripts/start.sh    # Start clusters for rehearsal/demo
 bash infra/scripts/stop.sh     # Stop AKS / delete EKS to save costs
-bash infra/aws/cleanup.sh      # Full EKS teardown (no charges remain)
-bash infra/azure/cleanup.sh    # Full AKS teardown (deletes resource group)
+bash infra/multi-cloud/cleanup.sh -y --wait   # Full multi-cloud teardown
 ```
 
-| Cluster | Running | Stopped | Cleaned up |
+| Stack | Running | Stopped | Cleaned up |
 | --- | --- | --- | --- |
-| AKS | ~$17/day | ~$0.03/day (disk) | $0 |
-| EKS | ~$5-8/day | n/a (must delete) | $0 |
+| Multi-cloud (Fleet + AKS + EKS) | ~$13/day | n/a (tear down to save) | $0 |
+| AKS standalone | ~$17/day | ~$0.03/day (disk) | $0 |
+| EKS standalone | ~$5-8/day | n/a (must delete) | $0 |
 
 See [SETUP.md](SETUP.md) for detailed instructions.
 
