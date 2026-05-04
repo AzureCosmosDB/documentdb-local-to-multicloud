@@ -274,3 +274,45 @@ Talking points:
   raw external IP/hostname — but the safe path is the port-forward.
 - If the VS Code extension misbehaves, mongoshell does the same job from a
   terminal split.
+
+## J) Cross-Cloud Failover Demo (Live App)
+
+This section covers the optional "big red button" failover demo at the end of
+the multi-cloud segment. The app lives in `app/failover-demo/` — see its
+README for full setup. This section is the on-stage script.
+
+**Prereqs (do this before going on stage):**
+
+1. Multi-cloud cluster from `infra/multi-cloud/` is up; `kubectl documentdb`
+   plugin on PATH.
+2. Two port-forwards running (separate terminals):
+   `kubectl --context azure-documentdb -n documentdb-preview-ns port-forward svc/documentdb-service-azure-documentdb 27018:10260`
+   `kubectl --context aws-documentdb   -n documentdb-preview-ns port-forward svc/documentdb-service-aws-documentdb   27019:10260`
+3. `app/failover-demo/clusters.json` filled in with the `docdb` password.
+4. `cd app/failover-demo && npm install && npm run dev` (server :4000, web :5173).
+
+**On-stage flow (~3 min):**
+
+1. Open http://localhost:5173 on the projector. Confirm AKS green PRIMARY,
+   EKS blue REPLICA, both reachable. Auto-insert is on at 2 Hz by default.
+2. Narrate the architecture for ~30s while counters tick. Point out the
+   replication lag number on the EKS panel.
+3. Click 🔴 **FAILOVER AKS → EKS**. Read modal, click **Failover now**.
+4. Narrate the streamed kubectl output: PROMOTING → RECONFIGURING → ROUTING.
+5. When the strip turns green (~30–45 s): EKS is now PRIMARY (green), AKS is
+   REPLICA (blue), and writes resume on EKS.
+6. (Optional) Show the event log at the bottom — the writer never paused,
+   only the *direction* changed.
+
+**If it goes sideways:**
+
+- Failover stuck on PROMOTING > 60s → the orchestrator times out and surfaces
+  the error in the strip. Skip ahead; the static slide explains the mechanism.
+- Both panels turn red mid-failover → port-forward dropped. Restart the
+  port-forwards; the panels recover within ~2s.
+- Auto-insert auto-pauses after 3 consecutive write failures. Toggle it back
+  on after the failover completes if needed.
+
+Failback (EKS → AKS) is the same button in reverse, *if* the demoted AKS
+member has finished re-bootstrapping as a replica. See the app's README for
+the open question on whether this is automatic.

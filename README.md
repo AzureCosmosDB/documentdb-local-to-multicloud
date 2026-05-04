@@ -86,6 +86,10 @@ Semantic search using deterministic fake embeddings (no OpenAI API key required)
 python scripts/vector_restaurants_demo.py --query "cozy romantic date night pasta" --mode compact --k 10
 ```
 
+### Cross-Cloud Failover Demo App (app/failover-demo)
+
+Live web app with a "big red button" that promotes the EKS replica to primary while writes flip in real time. See [`app/failover-demo/README.md`](app/failover-demo/README.md).
+
 ### Data Generation
 
 Generate fresh restaurant data with configurable hot clusters:
