@@ -8,7 +8,7 @@ param location string = resourceGroup().location
 param clusterName string = 'docdb-demo-aks'
 
 @description('Kubernetes version')
-param kubernetesVersion string = '1.33'
+param kubernetesVersion string = '1.35'
 
 @description('VM size for the node pool')
 param vmSize string = 'Standard_D4s_v5'
