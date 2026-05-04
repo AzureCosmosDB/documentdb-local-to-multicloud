@@ -43,6 +43,18 @@ REGION="${EKS_REGION:-us-west-2}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Convert a POSIX path to a path the host OS Windows binaries can read.
+# Under WSL, eksctl.exe (and other Windows-native binaries) cannot resolve
+# /mnt/c/... paths and need C:\... form. Git Bash / MSYS already use /c/...
+# which Windows binaries handle natively, so no conversion is needed there.
+to_winpath() {
+  if grep -qi microsoft /proc/version 2>/dev/null && command -v wslpath &>/dev/null; then
+    wslpath -w "$1"
+  else
+    echo "$1"
+  fi
+}
+
 # Get owner identity for tagging
 OWNER=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null | sed 's|.*/||' || echo "unknown")
 echo "Owner: $OWNER"
@@ -52,7 +64,7 @@ echo "Cluster: $CLUSTER_NAME"
 echo "Region: $REGION"
 
 # Create EKS cluster using eksctl (tags are defined in cluster-config.yaml metadata)
-eksctl create cluster -f "$SCRIPT_DIR/cluster-config.yaml"
+eksctl create cluster -f "$(to_winpath "$SCRIPT_DIR/cluster-config.yaml")"
 
 # Update kubeconfig
 aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION"
