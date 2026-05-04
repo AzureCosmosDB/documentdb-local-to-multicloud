@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+
+# Local scratch — credentials, demo URIs, ad-hoc notes (never commit)
+.local/
+
