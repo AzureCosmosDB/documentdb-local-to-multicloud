@@ -8,6 +8,20 @@ DATA_FILE="${DATA_FILE:-${SCRIPT_DIR}/booking-agents_vectors.json}"
 DB_NAME="${DB_NAME:-demodb}"
 COLLECTION_NAME="${COLLECTION_NAME:-stays}"
 
+# Convert path to Windows form when running Git Bash/WSL against a Windows
+# binary like mongosh.exe (which can't resolve /c/... or /mnt/c/...)
+to_winpath() {
+  local p="$1"
+  if command -v wslpath &>/dev/null; then
+    wslpath -w "$p" 2>/dev/null || echo "$p"
+  elif [[ "$(uname -s)" == *MINGW* ]] || [[ "$(uname -s)" == *MSYS* ]]; then
+    # Git Bash: /c/Users/... -> C:\Users\...
+    echo "$p" | sed -E 's|^/([a-zA-Z])/|\1:/|' | sed 's|/|\\|g'
+  else
+    echo "$p"
+  fi
+}
+
 # Default to local connection
 MONGODB_URI="${MONGODB_URI:-mongodb://demo:test@localhost:10260/?tls=true&tlsAllowInvalidCertificates=true}"
 
@@ -35,13 +49,24 @@ if command -v mongoimport &>/dev/null; then
     --jsonArray \
     --drop
 else
-  # Fallback to mongosh
+  # Fallback to mongosh — convert path if mongosh is a Windows binary
   echo "mongoimport not found, using mongosh..."
+  MONGOSH_DATA_FILE="$DATA_FILE"
+  if command -v mongosh &>/dev/null && mongosh --version 2>/dev/null | grep -qi "windows"; then
+    MONGOSH_DATA_FILE="$(to_winpath "$DATA_FILE")"
+  elif ! command -v mongosh &>/dev/null && command -v mongosh.exe &>/dev/null; then
+    MONGOSH_DATA_FILE="$(to_winpath "$DATA_FILE")"
+  elif [[ "$(uname -s)" == *MINGW* ]] || [[ "$(uname -s)" == *MSYS* ]] || grep -qi microsoft /proc/version 2>/dev/null; then
+    # On Windows shells, assume mongosh on PATH is the .exe
+    MONGOSH_DATA_FILE="$(to_winpath "$DATA_FILE")"
+  fi
+  # Escape backslashes for JS string literal
+  MONGOSH_DATA_FILE_ESC="${MONGOSH_DATA_FILE//\\/\\\\}"
   mongosh "$MONGODB_URI" --eval "
     use('$DB_NAME');
     db['$COLLECTION_NAME'].drop();
     const fs = require('fs');
-    const data = JSON.parse(fs.readFileSync('$DATA_FILE', 'utf8'));
+    const data = JSON.parse(fs.readFileSync('$MONGOSH_DATA_FILE_ESC', 'utf8'));
     const result = db['$COLLECTION_NAME'].insertMany(data);
     print('Inserted: ' + result.insertedIds.length + ' documents');
   " --quiet
