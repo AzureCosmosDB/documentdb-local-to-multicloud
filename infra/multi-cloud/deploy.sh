@@ -51,7 +51,7 @@ run() { echo "+ $*"; "$@"; }
 
 check_prerequisites() {
   echo "Checking prerequisites..."
-  for bin in az kubectl helm aws eksctl jq curl git make; do
+  for bin in az kubectl helm aws eksctl jq curl git make kubelogin; do
     if ! command -v "$bin" >/dev/null 2>&1; then
       echo "ERROR: $bin not found on PATH" >&2
       exit 1
@@ -71,6 +71,16 @@ check_prerequisites() {
     echo "ERROR: AWS credentials not configured (run 'aws sso login' or 'aws configure')" >&2
     exit 1
   fi
+  # az fleet extension is required for managing AKS Fleet Manager
+  if ! az extension show -n fleet >/dev/null 2>&1; then
+    echo "Installing missing az extension: fleet"
+    az extension add -n fleet --yes >/dev/null 2>&1 || {
+      echo "ERROR: failed to install az fleet extension" >&2
+      exit 1
+    }
+  fi
+  # Don't prompt to install other extensions interactively
+  az config set extension.use_dynamic_install=yes_without_prompt >/dev/null 2>&1 || true
   if [ ! -d "$OPERATOR_CHART_DIR" ]; then
     echo "Operator chart dir '$OPERATOR_CHART_DIR' not found."
     parent_dir="$(cd "$TEMPLATE_DIR/../../.." && pwd)"
@@ -153,6 +163,11 @@ aks_fleet_deploy() {
   echo "[AKS] Fetching Fleet hub + AKS member kubeconfig..."
   az fleet get-credentials --resource-group "$RESOURCE_GROUP" --name "$FLEET_NAME" --overwrite-existing >/dev/null
   az aks get-credentials --resource-group "$RESOURCE_GROUP" --name "$AKS_CLUSTER_NAME" --overwrite-existing >/dev/null
+  # Convert AAD-enabled hub kubeconfig to use az CLI tokens (non-interactive)
+  if command -v kubelogin >/dev/null 2>&1; then
+    kubelogin convert-kubeconfig -l azurecli --context "$HUB_CONTEXT" >/dev/null 2>&1 || true
+    kubelogin convert-kubeconfig -l azurecli --context "$AKS_CLUSTER_NAME" >/dev/null 2>&1 || true
+  fi
   echo "[AKS] Fleet hub + member ready (Fleet: $FLEET_NAME, member: $AKS_CLUSTER_NAME)"
 }
 
@@ -169,6 +184,31 @@ eks_deploy() {
       --nodes 2 --nodes-min 2 --nodes-max 2 \
       --managed --with-oidc
   fi
+
+  # Normalize the EKS kubeconfig context to a short, predictable name
+  # so subsequent kubectl/helm calls (which use --context "$EKS_CLUSTER_NAME")
+  # work whether eksctl just created the entry or it was created by a prior run.
+  clusterName="$EKS_CLUSTER_NAME.$EKS_REGION.eksctl.io"
+  fullName="documentdb-admin@$clusterName"
+  if [ -f "$HOME/.kube/config" ]; then
+    sed -i "s|$fullName|$EKS_CLUSTER_NAME|g" "$HOME/.kube/config" || true
+    sed -i "s|$clusterName|$EKS_CLUSTER_NAME|g" "$HOME/.kube/config" || true
+  fi
+  # Fallback for the ARN-style context name eksctl may write
+  arnCtx="arn:aws:eks:$EKS_REGION:$(aws sts get-caller-identity --query Account --output text):cluster/$EKS_CLUSTER_NAME"
+  if kubectl config get-contexts -o name 2>/dev/null | grep -qx "$arnCtx"; then
+    kubectl config delete-context "$EKS_CLUSTER_NAME" >/dev/null 2>&1 || true
+    kubectl config rename-context "$arnCtx" "$EKS_CLUSTER_NAME" >/dev/null
+  fi
+  # Also handle the user@cluster style name some eksctl versions emit
+  for candidate in "$(whoami)@$EKS_CLUSTER_NAME" "${USER:-}@$EKS_CLUSTER_NAME"; do
+    [ -z "$candidate" ] || [ "$candidate" = "@$EKS_CLUSTER_NAME" ] && continue
+    if kubectl config get-contexts -o name 2>/dev/null | grep -qx "$candidate"; then
+      kubectl config delete-context "$EKS_CLUSTER_NAME" >/dev/null 2>&1 || true
+      kubectl config rename-context "$candidate" "$EKS_CLUSTER_NAME" >/dev/null
+      break
+    fi
+  done
 
   echo "[EKS] Setting up EBS CSI driver..."
   eksctl create iamserviceaccount \
@@ -254,15 +294,6 @@ reclaimPolicy: Retain
 EOF
   fi
 
-  kubectl config delete-context "$EKS_CLUSTER_NAME" >/dev/null 2>&1 || true
-  kubectl config delete-cluster "$EKS_CLUSTER_NAME" >/dev/null 2>&1 || true
-  kubectl config delete-user    "$EKS_CLUSTER_NAME" >/dev/null 2>&1 || true
-  clusterName="$EKS_CLUSTER_NAME.$EKS_REGION.eksctl.io"
-  fullName="documentdb-admin@$clusterName"
-  if [ -f "$HOME/.kube/config" ]; then
-    sed -i "s|$fullName|$EKS_CLUSTER_NAME|g" "$HOME/.kube/config" || true
-    sed -i "s|$clusterName|$EKS_CLUSTER_NAME|g" "$HOME/.kube/config" || true
-  fi
   echo "[EKS] EKS member ready"
 }
 
