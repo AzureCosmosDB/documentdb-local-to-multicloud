@@ -21,6 +21,33 @@ booking dataset (`demodb.stays`, 1,000 short-term-rental listings with 1536-dim
 - [ ] `OPENAI_API_KEY` exported in the shell you'll use for the vector demo
 - [ ] kubectl contexts `azure-documentdb`, `aws-documentdb`, and `hub` configured
 
+### Multi-cloud deploy gotchas (read once before running deploy.sh)
+
+These bit me on the dry-run and deploy.sh now auto-handles most of them, but keep them in mind:
+
+1. **`az fleet` extension must be installed and pinned to a version compatible with your az CLI.**
+   On az 2.65 the latest fleet extension (1.9.0) crashes with
+   `cannot import name 'get_arm_endpoints' from 'azure.mgmt.core.tools'`.
+   Workaround: `az extension add -n fleet --version 1.5.0 --yes`.
+2. **`kubelogin` must be on PATH** — Fleet hub is AAD-enabled. After
+   `az fleet get-credentials`, run `kubelogin convert-kubeconfig -l azurecli --context hub`
+   (deploy.sh now does this automatically). Without it, every `kubectl --context hub`
+   triggers a device-code login that times out non-interactively.
+3. **Fleet RBAC propagation takes ~1–2 minutes.** First call may return
+   `Forbidden: User does not have access to the resource in Azure`. Wait and retry.
+4. **EKS context name varies by eksctl version.** deploy.sh now renames
+   `documentdb-admin@…`, `arn:aws:eks:…`, and `<user>@aws-documentdb` to plain
+   `aws-documentdb` so subsequent `--context aws-documentdb` calls work.
+5. **kubefleet member-agent helm chart needs helm ≥ 3.14.** Helm 3.12 fails with
+   `YAML parse error on member-agent/templates/crds/appliedworks.yaml`. Upgrade helm
+   before running deploy.sh, or skip the join step and use Fleet's update strategies
+   for CR distribution.
+6. **EKS kube-system pods (coredns, ebs-csi-controller, metrics-server) sometimes
+   crash-loop right after `eksctl create cluster`** if the node SG doesn't allow
+   kubelet (10250) from the control plane. Symptom: `dial tcp <nodeIP>:10250: i/o timeout`.
+   Fix: `aws ec2 authorize-security-group-ingress` for port 10250 from the
+   cluster security group, or recreate the cluster with `--node-private-networking=false`.
+
 ### Connection strings (paste-ready)
 
 | Where | Connection string |
