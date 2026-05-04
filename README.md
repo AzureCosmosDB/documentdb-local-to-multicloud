@@ -96,24 +96,49 @@ python scripts/generate_restaurants.py --count 5000 --hot-count 1000 --hot-cuisi
 
 ## Multi-Cloud Deployment
 
+> **Shell on Windows**: run these scripts from **Git Bash** or **WSL**. PowerShell is fine for the docker compose / Python steps above, but the deploy/cleanup scripts call bash directly.
+
 ### Azure (AKS)
 
 ```bash
+# Sign in once
+az login
+
+# Deploy AKS + cert-manager + DocumentDB operator + instance + load data
 bash infra/azure/deploy.sh
+
+# Tear it all down (asks for confirmation; pass --yes to skip)
+bash infra/azure/cleanup.sh
 ```
 
 ### AWS (EKS)
 
 ```bash
+# Sign in once (uses your SSO start URL — see SETUP.md)
+aws sso login
+
+# Deploy EKS + cert-manager + DocumentDB operator + instance + load data
 bash infra/aws/deploy.sh
+
+# Tear it all down (asks for confirmation; pass --yes to skip)
+bash infra/aws/cleanup.sh
 ```
+
+Both `deploy.sh` scripts are **idempotent** — safe to re-run. They skip cluster creation if the cluster already exists, use `helm upgrade --install` for the operator, and persist the generated DocumentDB password in a Kubernetes Secret so subsequent runs reuse it.
 
 ### Cost Management
 
 ```bash
-bash infra/scripts/start.sh   # Start clusters for rehearsal/demo
-bash infra/scripts/stop.sh    # Stop/delete to save costs
+bash infra/scripts/start.sh    # Start clusters for rehearsal/demo
+bash infra/scripts/stop.sh     # Stop AKS / delete EKS to save costs
+bash infra/aws/cleanup.sh      # Full EKS teardown (no charges remain)
+bash infra/azure/cleanup.sh    # Full AKS teardown (deletes resource group)
 ```
+
+| Cluster | Running | Stopped | Cleaned up |
+| --- | --- | --- | --- |
+| AKS | ~$17/day | ~$0.03/day (disk) | $0 |
+| EKS | ~$5-8/day | n/a (must delete) | $0 |
 
 See [SETUP.md](SETUP.md) for detailed instructions.
 

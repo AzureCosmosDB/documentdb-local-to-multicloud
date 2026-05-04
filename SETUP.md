@@ -2,6 +2,8 @@
 
 Complete setup instructions for the "From Localhost to Multi-Cloud" demo environment.
 
+> **Windows users**: the deploy/cleanup scripts under `infra/` are bash scripts. Run them from **Git Bash** (recommended) or **WSL**. PowerShell works for the `docker compose`, `python`, and `az`/`aws` CLI commands but cannot execute the `.sh` files directly.
+
 ## Prerequisites
 
 ### Tools Required
@@ -12,6 +14,7 @@ Complete setup instructions for the "From Localhost to Multi-Cloud" demo environ
 | VS Code | IDE + DocumentDB extension | [code.visualstudio.com](https://code.visualstudio.com/) |
 | DocumentDB for VS Code | DB explorer, query editor, Index Advisor | [Marketplace](https://marketplace.visualstudio.com/items?itemName=ms-azuretools.vscode-documentdb) |
 | mongosh | MongoDB shell | [mongodb.com](https://www.mongodb.com/try/download/shell) |
+| Git Bash (Windows) | bash for the deploy scripts | bundled with [Git for Windows](https://git-scm.com/download/win) |
 | Azure CLI | AKS deployment | [Install](https://learn.microsoft.com/cli/azure/install-azure-cli) |
 | AWS CLI | EKS deployment | [Install](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) |
 | eksctl | EKS cluster management | [eksctl.io](https://eksctl.io/) |
@@ -22,6 +25,17 @@ Complete setup instructions for the "From Localhost to Multi-Cloud" demo environ
 
 - **Azure subscription** with Contributor access
 - **AWS account** with IAM permissions for EKS, EBS, and Load Balancer
+
+#### AWS authentication
+
+If your AWS account uses **IAM Identity Center (SSO)** — typical for organizations — you cannot use `signin.aws.amazon.com/console` with a username/password. Instead:
+
+1. Open the **AWS access portal URL** from your invitation email (looks like `https://d-xxxxxxxxxx.awsapps.com/start/`).
+2. Sign in there with your SSO username + password.
+3. Configure the CLI once with `aws configure sso` (or write `~/.aws/config` directly with `sso_start_url`, `sso_region`, `sso_account_id`, `sso_role_name`).
+4. Then `aws sso login` triggers the browser flow and caches a token.
+
+For plain IAM users, `aws configure` with an access key / secret key still works.
 
 ---
 
@@ -110,7 +124,7 @@ This will:
 ### Phase 4: Deploy to EKS (AWS)
 
 ```bash
-# Configure AWS CLI
+# Configure AWS CLI (or 'aws sso login' if your account uses IAM Identity Center)
 aws configure
 
 # Deploy EKS + DocumentDB operator + instance + load data + wipe indexes
@@ -128,9 +142,46 @@ This will:
 **Estimated time:** 20-25 minutes
 **Estimated cost:** ~$5-8/day ($140-230/month) while running
 
+The script is **idempotent** — re-running it skips cluster creation if it already exists, upgrades the helm release in place, and reuses the password stored in the `docdb-demo-password` Secret.
+
 ### Phase 5: Multi-Cloud (both clusters)
 
 Use `infra/scripts/start.sh` → option 3 to verify both clusters are running, or deploy individually using Phases 4 and 5.
+
+---
+
+## Cleanup / Teardown
+
+Always tear down clusters when you're done — EKS in particular continues billing until deleted.
+
+### Full teardown (recommended after the event)
+
+```bash
+# AWS (deletes EKS cluster and all dependencies, ~10-12 min)
+bash infra/aws/cleanup.sh
+
+# Azure (deletes the entire docdb-demo-rg resource group)
+bash infra/azure/cleanup.sh
+
+# Stop the local Docker container
+docker rm -f docdb
+```
+
+Both cleanup scripts:
+- Prompt for confirmation by default — pass `--yes` (or `-y`) to skip in automation
+- Are **safe to re-run** — each step skips if the resource is already gone
+- Remove resources in dependency order (DocumentDB instance → operator → cert-manager → cluster), so cloud load balancers are released cleanly before the cluster goes away
+
+### Verify nothing is left
+
+```bash
+# AWS
+aws cloudformation list-stacks --region us-west-2 --query "StackSummaries[?contains(StackName,'docdb')]"
+aws eks list-clusters --region us-west-2
+
+# Azure
+az group exists --name docdb-demo-rg
+```
 
 ---
 

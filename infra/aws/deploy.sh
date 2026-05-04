@@ -64,12 +64,17 @@ echo "Cluster: $CLUSTER_NAME"
 echo "Region: $REGION"
 
 # Create EKS cluster using eksctl (tags are defined in cluster-config.yaml metadata)
-eksctl create cluster -f "$(to_winpath "$SCRIPT_DIR/cluster-config.yaml")"
+# Idempotent: skip cluster creation if it already exists.
+if aws eks describe-cluster --name "$CLUSTER_NAME" --region "$REGION" >/dev/null 2>&1; then
+  echo "EKS cluster '$CLUSTER_NAME' already exists in $REGION — skipping create."
+else
+  eksctl create cluster -f "$(to_winpath "$SCRIPT_DIR/cluster-config.yaml")"
+fi
 
-# Update kubeconfig
-aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION"
+# Update kubeconfig (always, in case context isn't set)
+aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION" --alias eks-demo
 
-# Create gp3 storage class
+# Create gp3 storage class (idempotent via apply)
 cat <<EOF | kubectl apply -f -
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -87,27 +92,36 @@ EOF
 echo ""
 echo "=== Installing DocumentDB operator ==="
 
-# Install cert-manager
+# Install cert-manager (idempotent via apply)
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
 echo "Waiting for cert-manager..."
-kubectl wait --for=condition=available --timeout=120s deployment/cert-manager -n cert-manager
-kubectl wait --for=condition=available --timeout=120s deployment/cert-manager-webhook -n cert-manager
+kubectl wait --for=condition=available --timeout=180s deployment/cert-manager -n cert-manager
+kubectl wait --for=condition=available --timeout=180s deployment/cert-manager-webhook -n cert-manager
 
-# Install DocumentDB operator
-helm repo add documentdb https://documentdb.github.io/documentdb-kubernetes-operator
+# Install DocumentDB operator (helm upgrade --install for idempotency)
+helm repo add documentdb https://documentdb.github.io/documentdb-kubernetes-operator 2>/dev/null || true
 helm repo update
-helm install documentdb-operator documentdb/documentdb-operator \
+helm upgrade --install documentdb-operator documentdb/documentdb-operator \
   --namespace documentdb-operator --create-namespace
 
 echo "Waiting for operator..."
-kubectl wait --for=condition=available --timeout=120s deployment/documentdb-operator -n documentdb-operator
+kubectl wait --for=condition=available --timeout=180s deployment/documentdb-operator -n documentdb-operator
 
 echo ""
 echo "=== Deploying DocumentDB instance ==="
 
-DOCDB_PASSWORD="${DOCDB_PASSWORD:-$(openssl rand -base64 16)}"
-
+# Persist password across re-runs: store in a Secret on first deploy, reuse on subsequent runs.
 kubectl create namespace documentdb-ns --dry-run=client -o yaml | kubectl apply -f -
+
+if kubectl get secret docdb-demo-password -n documentdb-ns >/dev/null 2>&1; then
+  DOCDB_PASSWORD="$(kubectl get secret docdb-demo-password -n documentdb-ns -o jsonpath='{.data.password}' | base64 -d)"
+  echo "Reusing existing DocumentDB password from Secret docdb-demo-password."
+else
+  DOCDB_PASSWORD="${DOCDB_PASSWORD:-$(openssl rand -base64 16)}"
+  kubectl create secret generic docdb-demo-password \
+    --namespace documentdb-ns \
+    --from-literal=password="$DOCDB_PASSWORD"
+fi
 
 cat <<EOF | kubectl apply -f -
 apiVersion: documentdb.io/preview
