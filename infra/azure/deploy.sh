@@ -99,7 +99,7 @@ if kubectl get secret docdb-demo-credentials -n documentdb-ns >/dev/null 2>&1; t
   DOCDB_PASSWORD="$(kubectl get secret docdb-demo-credentials -n documentdb-ns -o jsonpath='{.data.password}' | base64 -d)"
   echo "Reusing existing DocumentDB credentials from Secret docdb-demo-credentials."
 else
-  DOCDB_PASSWORD="${DOCDB_PASSWORD:-$(openssl rand -base64 16)}"
+  DOCDB_PASSWORD="${DOCDB_PASSWORD:-$(openssl rand -hex 16)}"
   kubectl create secret generic docdb-demo-credentials \
     --namespace documentdb-ns \
     --from-literal=username=docdb \
