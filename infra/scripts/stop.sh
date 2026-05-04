@@ -1,68 +1,54 @@
 #!/bin/bash
-# Stop demo infrastructure - save costs when not rehearsing
-# AKS can be stopped (preserves state). EKS must be deleted.
+# Stop demo infrastructure - save costs when not rehearsing.
+#
+# The multi-cloud stack (Fleet + AKS + EKS + Istio) cannot be partially stopped
+# in a useful way — Fleet membership, Istio mesh, and CNPG WAL replication all
+# expect both members up. So "stop" here means tear it all down via
+# infra/multi-cloud/cleanup.sh and redeploy on demo day.
 set -euo pipefail
 
-RESOURCE_GROUP="${RESOURCE_GROUP:-docdb-demo-rg}"
-AKS_CLUSTER="${AKS_CLUSTER:-docdb-demo-aks}"
-EKS_CLUSTER="${EKS_CLUSTER:-docdb-demo-eks}"
-EKS_REGION="${EKS_REGION:-us-west-2}"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 echo "============================================"
 echo "  DocumentDB Demo Infrastructure - STOP"
 echo "============================================"
 echo ""
 echo "Choose what to stop:"
-echo "  1) AKS only (stops cluster, preserves state, ~free)"
-echo "  2) EKS only (deletes cluster to stop billing)"
-echo "  3) Both clusters"
-echo "  4) Local only (stop Docker container)"
-echo "  5) DESTROY everything (delete all resources)"
-read -rp "Selection [1-5]: " choice
+echo "  1) Local only (stop Docker container)"
+echo "  2) Multi-cloud (DESTROY: AKS + EKS + Fleet + RG)"
+echo "  3) Show status only"
+read -rp "Selection [1-3]: " choice
 
 case $choice in
   1)
-    echo "=== Stopping AKS cluster ==="
-    az aks stop --resource-group "$RESOURCE_GROUP" --name "$AKS_CLUSTER"
-    echo "✅ AKS stopped. No compute charges while stopped."
-    echo "   Storage charges continue (~\$1/month for disks)."
-    echo "   Restart with: ./start.sh → option 1"
-    ;;
-  2)
-    echo "=== Deleting EKS cluster ==="
-    echo "⚠️  EKS cannot be stopped, only deleted. Data will be lost."
-    read -rp "Continue? [y/N]: " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-      eksctl delete cluster --name "$EKS_CLUSTER" --region "$EKS_REGION" --wait
-      echo "✅ EKS deleted. No further charges."
-    fi
-    ;;
-  3)
-    echo "=== Stopping AKS ==="
-    az aks stop --resource-group "$RESOURCE_GROUP" --name "$AKS_CLUSTER" &
-    echo "=== Deleting EKS ==="
-    eksctl delete cluster --name "$EKS_CLUSTER" --region "$EKS_REGION" --wait &
-    wait
-    echo "✅ Both clusters stopped/deleted."
-    ;;
-  4)
     echo "=== Stopping local DocumentDB ==="
     docker stop docdb 2>/dev/null && echo "✅ Container stopped" || echo "Container not running"
     ;;
-  5)
-    echo "⚠️  This will DELETE all Azure and AWS resources permanently."
+  2)
+    echo "⚠️  This deletes the entire multi-cloud stack:"
+    echo "   - Azure RG (Fleet hub + AKS member + DNS zones)"
+    echo "   - EKS cluster + all CloudFormation stacks"
+    echo "   - All DocumentDB data on both clouds"
+    echo ""
     read -rp "Type 'destroy' to confirm: " confirm
     if [[ "$confirm" == "destroy" ]]; then
-      echo "Deleting Azure resource group..."
-      az group delete --name "$RESOURCE_GROUP" --yes --no-wait
-      echo "Deleting EKS cluster..."
-      eksctl delete cluster --name "$EKS_CLUSTER" --region "$EKS_REGION" --wait 2>/dev/null || true
-      echo "Stopping local Docker..."
-      docker rm -f docdb 2>/dev/null || true
-      echo "✅ All resources destroyed."
+      bash "$REPO_ROOT/infra/multi-cloud/cleanup.sh" -y --wait
+      echo "✅ Multi-cloud stack destroyed."
+      echo "   Redeploy with: bash infra/multi-cloud/deploy.sh"
     else
       echo "Cancelled."
     fi
+    ;;
+  3)
+    echo "=== Local ==="
+    docker ps --filter name=docdb --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
+    echo ""
+    echo "=== Azure ==="
+    az group exists --name docdb-multicloud-rg 2>/dev/null && \
+      echo "RG docdb-multicloud-rg: exists" || echo "RG docdb-multicloud-rg: gone"
+    echo ""
+    echo "=== AWS (us-west-2) ==="
+    aws eks list-clusters --region us-west-2 --output text 2>/dev/null || echo "(aws not configured)"
     ;;
   *)
     echo "Invalid selection"
@@ -72,6 +58,5 @@ esac
 
 echo ""
 echo "💰 Cost reminder:"
-echo "   AKS stopped: ~\$1/mo (disk storage only)"
-echo "   EKS running: ~\$140-230/mo"
-echo "   AKS running: ~\$512/mo"
+echo "   Local Docker:  free"
+echo "   Multi-cloud:   ~\$13/day running (~\$390/mo if left up)"
