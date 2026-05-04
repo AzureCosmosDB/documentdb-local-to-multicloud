@@ -39,9 +39,35 @@ kubectl describe documentdb docdb-demo -n documentdb-ns
 # Get external IP
 kubectl get svc -n documentdb-ns
 
-# Connect
+# Get the auto-generated password
+kubectl get secret -n documentdb-ns docdb-demo-credentials -o jsonpath='{.data.password}' | base64 -d
+```
+
+**Two ways to connect:**
+
+**(a) Direct via LoadBalancer** — works for `mongosh` from a clean shell, but the cloud LB sometimes drops the TLS handshake (LB health probes, session affinity, SNI mismatch on the gateway's self-signed `localhost` cert). Good for showing "this is a real public endpoint."
+```bash
 mongosh "mongodb://docdb:<password>@<EXTERNAL-IP>:10260/?tls=true&tlsAllowInvalidCertificates=true&authMechanism=SCRAM-SHA-256"
 ```
+
+**(b) Persistent port-forward (recommended for VS Code + reliable demos)** — bypasses the LB, auto-reconnects if it drops:
+```bash
+# Foreground, prints the connection URI on startup:
+infra/scripts/portforward.sh
+
+# Or one-shot:
+kubectl port-forward -n documentdb-ns svc/documentdb-service-docdb-demo 11260:10260
+```
+Then in **VS Code → DocumentDB extension → + Add Connection**, paste:
+```
+mongodb://docdb:<password>@localhost:11260/?tls=true&tlsAllowInvalidCertificates=true&authMechanism=SCRAM-SHA-256
+```
+Label it `AKS — docdb-demo (port-fwd)`.
+
+> **Why port-forward?** Self-signed cert on the gateway + Azure LB session
+> behavior makes the public TLS path flaky. Port-forward is one terminal away
+> and just works. `infra/scripts/portforward.sh` keeps the tunnel alive across
+> drops so you don't have to babysit it during a talk.
 
 ### 4. Show Same Data
 

@@ -183,3 +183,45 @@ In the extension, open **Index Advisor** (or the equivalent insights/advisor UI)
 - CI: see `.github/workflows/ci.yml`
 - Kubernetes: see `k8s/`
 - Monitoring: see `monitoring/`
+
+## 9) Run the same demo against AKS (cloud)
+
+Once `infra/azure/deploy.sh` has stood up the AKS cluster + DocumentDB instance
+(see [demo/04-aks/README.md](../demo/04-aks/README.md)), you can connect the
+VS Code DocumentDB extension to it and run the exact same queries as local.
+
+### Why a port-forward (and not the public IP)?
+
+The DocumentDB gateway uses a self-signed cert (CN=`localhost`) baked into the
+image. Outside of the cluster, the Azure LoadBalancer in front of it can drop
+the TLS handshake (LB health probes hammer the gateway with non-TLS pings, and
+some clients stumble on the SNI mismatch). A `kubectl port-forward` skips the
+LB entirely and gives you a clean, reliable tunnel — which is what the VS Code
+extension wants.
+
+You only need to do this if you want to drive the cloud instance from your
+laptop. Apps running *inside* the cluster don't need it.
+
+### Start a persistent port-forward
+
+```bash
+infra/scripts/portforward.sh
+```
+
+This:
+- Reads the username/password from the `docdb-demo-credentials` secret
+- Prints a ready-to-paste `mongodb://...@localhost:11260/...` URI
+- Auto-restarts the tunnel if it drops (laptop sleep, idle timeout, pod
+  restart) so you don't have to babysit it during a talk
+
+Leave the terminal running. `Ctrl+C` to stop. Override `CONTEXT`,
+`NAMESPACE`, `LOCAL_PORT`, etc. via env vars if needed.
+
+### Add the connection in VS Code
+
+1. **DocumentDB extension → + Add Connection**
+2. Paste the URI printed by `portforward.sh`
+3. Label it `AKS — docdb-demo (port-fwd)`
+
+You can now run the same queries from sections 4–7 against the cloud instance.
+
