@@ -321,18 +321,28 @@ app.post("/api/promote", async (req, res) => {
   ]);
   invalidatePrimaryCtxCache();
   if (out.code === 0) {
-    // Background: reconcile + warm. The reconcile runs on a short delay so
-    // the operator has had a chance to write its (broken) promotionToken
-    // and (slow) sync block before we overwrite them.
+    // Background: reconcile + warm + heal-stale-token. The DocumentDB
+    // operator's cross-cloud promote handshake is unreliable on the preview
+    // operator (see issue documentdb/documentdb-kubernetes-operator#375): it
+    // races against itself and frequently leaves the new primary in
+    // "unrecoverable" with phaseReason "Promotion token content is not
+    // correct for current instance" because the token it stamped no longer
+    // matches the cluster's actual WAL position.
+    //
+    // We work around that by polling the new primary's CNPG state for up
+    // to ~3 minutes and, if we see the stale-token symptom, automatically
+    // running the same recovery the "Force-promote (local token)" button
+    // does: read this cluster's local promotion-token ConfigMap and stamp
+    // it onto spec.replica.promotionToken + replica.primary=self. CNPG
+    // then promotes pod-1 in place against its actual timeline.
     (async () => {
       try {
         await new Promise((r) => setTimeout(r, 6000));
-        // Retry reconcile a few times — operator may re-stamp settings
-        // during the promotion handshake.
         for (let i = 0; i < 4; i++) {
           await reconcileNewPrimary(ctx).catch((e) => console.warn(`[reconcile:${ctx}] attempt ${i+1} failed: ${e.message || e}`));
           await new Promise((r) => setTimeout(r, 4000));
         }
+        await healStaleTokenIfNeeded(ctx);
         await getMongoDb(ctx);
         await refreshListingsCache(ctx);
         console.log(`[warm] re-primed mongo + listings cache for new primary ${ctx}`);
@@ -343,6 +353,65 @@ app.post("/api/promote", async (req, res) => {
   }
   res.json({ ok: out.code === 0, stdout: out.stdout, stderr: out.stderr });
 });
+
+// Workaround for documentdb/documentdb-kubernetes-operator#375: after a
+// promote the operator may leave the new primary stuck in "unrecoverable"
+// with a stale promotionToken. Poll for that state for ~3 minutes and, if
+// detected, repeatedly stamp the cluster's own current local promotion-token
+// (from the sidecar ConfigMap) onto spec.replica until CNPG accepts it and
+// the cluster transitions to healthy.
+async function healStaleTokenIfNeeded(ctx) {
+  const deadline = Date.now() + 3 * 60 * 1000;
+  let cnpgName = null;
+  let healed = false;
+  while (Date.now() < deadline) {
+    const c = await findCNPGCluster(ctx).catch(() => null);
+    if (!c?.metadata?.name) {
+      await new Promise((r) => setTimeout(r, 5000));
+      continue;
+    }
+    cnpgName = c.metadata.name;
+    const phase = c.status?.phase || "";
+    const reason = c.status?.phaseReason || "";
+    const isHealthy = /healthy/i.test(phase) && c.status?.readyInstances === c.status?.instances;
+    if (isHealthy) {
+      if (healed) console.log(`[heal:${ctx}] cluster healthy after token heal`);
+      return;
+    }
+    if (/unrecoverable/i.test(phase) && /promotion token/i.test(reason)) {
+      try {
+        const cmOut = await kubectl([
+          "--context", ctx, "-n", NAMESPACE,
+          "get", "cm", "promotion-token",
+          "-o", "jsonpath={.data.index\\.html}",
+        ]);
+        const localToken = cmOut.stdout?.trim();
+        if (localToken) {
+          const patch = JSON.stringify({
+            spec: { replica: { primary: cnpgName, promotionToken: localToken } },
+          });
+          const r = await kubectl([
+            "--context", ctx, "-n", NAMESPACE,
+            "patch", "cluster.postgresql.cnpg.io", cnpgName,
+            "--type=merge", "-p", patch,
+          ]);
+          if (r.code === 0) {
+            healed = true;
+            console.log(`[heal:${ctx}] stamped local promotionToken (len=${localToken.length}) onto ${cnpgName}`);
+          } else {
+            console.warn(`[heal:${ctx}] patch failed: ${r.stderr || r.stdout}`);
+          }
+        } else {
+          console.warn(`[heal:${ctx}] local promotion-token CM empty, cannot heal yet`);
+        }
+      } catch (err) {
+        console.warn(`[heal:${ctx}] error: ${err.message || err}`);
+      }
+    }
+    await new Promise((r) => setTimeout(r, 10000));
+  }
+  console.warn(`[heal:${ctx}] gave up waiting for cluster to heal after 3 minutes`);
+}
 
 async function clearStaleTokenHandler(req, res) {
   const ctx = String(req.body?.context || "");
