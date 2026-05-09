@@ -149,33 +149,6 @@
     .badge.healthy { background: rgba(22,163,74,0.12); color: var(--cp-success); }
     .badge.unhealthy { background: rgba(220,38,38,0.12); color: var(--cp-danger); }
     .badge.warn { background: rgba(245,158,11,0.16); color: var(--cp-warning); }
-    .write-banner {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 12px 16px;
-      border-radius: 0.625rem;
-      margin-bottom: 12px;
-      border: 1px solid var(--cp-border);
-      background: var(--cp-surface);
-      font-size: 14px;
-      color: var(--cp-text);
-    }
-    .write-banner.ready { border-color: rgba(22,163,74,0.4); background: rgba(22,163,74,0.06); }
-    .write-banner.failover { border-color: rgba(245,158,11,0.5); background: rgba(245,158,11,0.08); }
-    .write-banner.down { border-color: rgba(220,38,38,0.5); background: rgba(220,38,38,0.08); }
-    .write-banner .dot {
-      width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
-    }
-    .write-banner.ready .dot { background: var(--cp-success); }
-    .write-banner.failover .dot { background: var(--cp-warning); animation: pulse 1.2s infinite; }
-    .write-banner.down .dot { background: var(--cp-danger); }
-    .write-banner .reason { color: var(--cp-text-muted); font-size: 12px; margin-left: 4px; }
-    .write-banner .timer { color: var(--cp-text-soft); font-size: 12px; font-family: Consolas, "Courier New", Courier, monospace; margin-left: auto; }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.35; }
-    }
     .row {
       display: flex;
       justify-content: space-between;
@@ -427,7 +400,6 @@
   </nav>
   <main>
     <section id="pane-topology" class="pane active">
-      <div id="topologyBanner" class="write-banner"></div>
       <div id="meta" class="meta-bar"></div>
       <div id="error"></div>
       <div id="grid" class="grid"></div>
@@ -440,7 +412,6 @@
       </div>
     </section>
     <section id="pane-data" class="pane">
-      <div id="bookingsBanner" class="write-banner"></div>
       <div class="meta-bar" style="margin-bottom:12px;">
         <div>Add a booking on the global primary; watch it stream to the replica via Postgres physical replication.</div>
       </div>
@@ -492,8 +463,6 @@
   <script>
     const $ = (id) => document.getElementById(id);
     let timer = null;
-    let lastWriteState = null;
-    let writeStateChangedAt = Date.now();
 
     function fmt(v) { return v == null || v === "" ? "—" : v; }
 
@@ -513,7 +482,6 @@
       if (rep.ok) {
         return { state: "ready", primary: primary.context, reason: "" };
       }
-      // Distinguish "transient failover-in-progress" from "broken / needs intervention".
       const r = String(rep.reason || "").toLowerCase();
       const isFailoverTransient =
         /waiting for the instances/i.test(primary.phase || "") ||
@@ -529,63 +497,7 @@
       if (isFailoverTransient) {
         return { state: "failover", primary: primary.context, reason: rep.reason };
       }
-      // Primary phase reports unhealthy and it's not the standard failover dance.
       return { state: "down", primary: primary.context, reason: rep.reason };
-    }
-
-    function fmtElapsed(ms) {
-      const s = Math.max(0, Math.floor(ms / 1000));
-      const mm = String(Math.floor(s / 60)).padStart(2, "0");
-      const ss = String(s % 60).padStart(2, "0");
-      return `${mm}:${ss}`;
-    }
-
-    function renderWriteBanner(elId, status) {
-      const el = $(elId);
-      if (!el) return;
-      el.classList.remove("ready", "failover", "down");
-      el.classList.add(status.state);
-      let label, sub = "";
-      const since = Date.now() - writeStateChangedAt;
-      if (status.state === "ready") {
-        label = `Cross-cloud replication healthy — writes accepted on <strong>${status.primary}</strong>`;
-      } else if (status.state === "failover") {
-        label = `Failover in progress — do <strong>NOT</strong> write yet`;
-        sub = status.reason ? `<span class="reason">${status.reason}</span>` : "";
-      } else {
-        label = `No writeable primary available`;
-        sub = status.reason ? `<span class="reason">${status.reason}</span>` : "";
-      }
-      const timer = (status.state === "failover" || status.state === "down")
-        ? `<span class="timer">${fmtElapsed(since)}</span>`
-        : "";
-      el.innerHTML = `<span class="dot"></span><span>${label}</span>${sub}${timer}`;
-    }
-
-    function applyWriteGate(status) {
-      const blocked = status.state !== "ready";
-      const tip = blocked
-        ? `Writes blocked: ${status.reason || "failover in progress"}. Wait for the green banner.`
-        : "";
-      ["insertBtn", "batchBtn", "seedBtn"].forEach((id) => {
-        const btn = $(id);
-        if (!btn) return;
-        // Don't fight in-flight per-button disables (those use .dataset.busy="1")
-        if (btn.dataset.busy === "1") return;
-        btn.disabled = blocked;
-        btn.title = blocked ? tip : btn.dataset.origTitle || "";
-      });
-    }
-
-    function updateWriteStatusUI(data) {
-      const status = getWriteStatus(data);
-      if (status.state !== lastWriteState) {
-        lastWriteState = status.state;
-        writeStateChangedAt = Date.now();
-      }
-      renderWriteBanner("topologyBanner", status);
-      renderWriteBanner("bookingsBanner", status);
-      applyWriteGate(status);
     }
 
     function renderClusters(data) {
@@ -705,7 +617,6 @@
         lastTopology = j;
         renderMeta(j);
         renderClusters(j);
-        updateWriteStatusUI(j);
         $("lastRefresh").textContent = new Date(j.ts).toLocaleTimeString();
       } catch (err) {
         $("error").innerHTML = `<div class="err">${err.message}</div>`;
