@@ -1,6 +1,0 @@
-node_modules
-dist
-.env
-clusters.json
-*.log
-.vite
