@@ -8,3 +8,19 @@ __pycache__/
 # Local scratch — credentials, demo URIs, ad-hoc notes (never commit)
 .local/
 
+# TLS material for cross-cloud setup — generated locally, contains private keys
+infra/multi-cloud/certs/
+
+# Local deploy/port-forward logs (kept on disk for triage, not in source)
+infra/**/.deploy-*.log
+infra/**/.cleanup-*.log
+infra/scripts/.portforward*
+
+# Intermediate data-prep artifacts (generated; not source-of-truth)
+data/_*
+data/*_vectors.json
+data/*_vectors.json.bak*
+
+# Vendored operator chart tarballs (large; pulled fresh by deploy.sh)
+infra/multi-cloud/*.tgz
+

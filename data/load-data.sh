@@ -4,9 +4,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DATA_FILE="${DATA_FILE:-${SCRIPT_DIR}/booking-agents_vectors.json}"
-DB_NAME="${DB_NAME:-demodb}"
-COLLECTION_NAME="${COLLECTION_NAME:-stays}"
+DATA_FILE="${DATA_FILE:-${SCRIPT_DIR}/listings_vectors.json}"
+DB_NAME="${DB_NAME:-bookingsdb}"
+COLLECTION_NAME="${COLLECTION_NAME:-listings}"
 
 # Convert path to Windows form when running Git Bash/WSL against a Windows
 # binary like mongosh.exe (which can't resolve /c/... or /mnt/c/...)

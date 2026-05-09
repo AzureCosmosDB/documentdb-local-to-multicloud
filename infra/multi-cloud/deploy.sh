@@ -223,6 +223,26 @@ eks_deploy() {
     --region "$EKS_REGION" \
     --force >/dev/null
   sleep 5
+
+  # Pod-to-pod traffic uses the cluster security group only (VPC CNI). Without
+  # self-ingress, kube-system (CoreDNS, ebs-csi, metrics-server) crashloops.
+  # See docs/upstream-issues.md #4.
+  echo "[EKS] Adding security group ingress rules for pod-to-pod traffic..."
+  CLUSTER_SG=$(aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$EKS_REGION" \
+    --query "cluster.resourcesVpcConfig.clusterSecurityGroupId" --output text)
+  NODE_SG=$(aws ec2 describe-security-groups --region "$EKS_REGION" \
+    --filters "Name=tag:eksctl.cluster.k8s.io/v1alpha1/cluster-name,Values=$EKS_CLUSTER_NAME" \
+              "Name=group-name,Values=*nodegroup*" \
+    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "")
+  for SRC in "$CLUSTER_SG" "$NODE_SG"; do
+    [ -z "$SRC" ] || [ "$SRC" = "None" ] && continue
+    aws ec2 authorize-security-group-ingress --region "$EKS_REGION" \
+      --group-id "$CLUSTER_SG" --source-group "$SRC" --protocol all >/dev/null 2>&1 || true
+    [ -n "$NODE_SG" ] && [ "$NODE_SG" != "None" ] && \
+      aws ec2 authorize-security-group-ingress --region "$EKS_REGION" \
+        --group-id "$NODE_SG" --source-group "$SRC" --protocol all >/dev/null 2>&1 || true
+  done
+
   kubectl --context "$EKS_CLUSTER_NAME" wait --for=condition=ready pod -l app=ebs-csi-controller -n kube-system --timeout=300s 2>/dev/null || true
 
   echo "[EKS] Installing AWS Load Balancer Controller..."
@@ -366,8 +386,25 @@ pushd "$temp_dir" >/dev/null
 git clone --quiet https://github.com/kubefleet-dev/kubefleet.git
 git clone --quiet https://github.com/Azure/fleet-networking.git
 
+# Windows checkouts materialise git symlinks as text files containing the link
+# target. Restore them so helm can parse the chart. (See docs/upstream-issues.md)
+restore_chart_symlinks() {
+  local chartroot="$1"
+  find "$chartroot" -type f \( -name '*.yaml' -o -name '*.yml' \) -size -300c -print0 \
+    | while IFS= read -r -d '' f; do
+        local content target resolved
+        content=$(tr -d '[:space:]' <"$f")
+        if [[ "$content" =~ ^\.\..*\.yaml$|^\.\..*\.yml$ ]]; then
+          target=$(cat "$f" | tr -d '\r\n')
+          resolved="$(dirname "$f")/$target"
+          [ -f "$resolved" ] && cp "$resolved" "$f"
+        fi
+      done
+}
+
 pushd "$temp_dir/kubefleet" >/dev/null
 git checkout --quiet d3f42486fa78874e33ba8e6e5e34636767f77b8f
+restore_chart_symlinks charts/
 chmod +x hack/membership/joinMC.sh
 NON_AKS_MEMBERS=()
 for c in "${MEMBER_CLUSTER_NAMES[@]}"; do
@@ -383,8 +420,17 @@ for c in "${NON_AKS_MEMBERS[@]}"; do
 done
 
 pushd "$temp_dir/fleet-networking" >/dev/null
+restore_chart_symlinks charts/
 chmod +x hack/membership/joinMC.sh
 hack/membership/joinMC.sh "v0.16.5" "v0.3.24" "$HUB_CONTEXT" "${NON_AKS_MEMBERS[@]}"
+# Apply networking CRDs explicitly (joinMC.sh does this with `apply -f config/crd/*`
+# which fails because that's a directory with subdirs)
+for c in "${NON_AKS_MEMBERS[@]}"; do
+  for crd in config/crd/bases/*.yaml; do
+    kubectl --context "$c" apply -f "$crd" >/dev/null
+  done
+  kubectl --context "$c" -n fleet-system rollout restart deploy member-net-controller-manager >/dev/null
+done
 popd >/dev/null
 popd >/dev/null
 
@@ -403,9 +449,20 @@ done
 echo ""
 echo "=== Installing Istio multi-cluster mesh ==="
 istio_tmp=$(mktemp -d)
+# Pin to 1.23.x — Istio 1.24+ removed IstioOperator API used by samples/multicluster.
+ISTIO_VERSION="${ISTIO_VERSION_OVERRIDE:-1.23.4}"
 if ! command -v istioctl >/dev/null 2>&1; then
-  ISTIO_VERSION="1.24.0"
-  curl -sL https://istio.io/downloadIstio | ISTIO_VERSION=$ISTIO_VERSION TARGET_ARCH=x86_64 sh - -d "$istio_tmp" >/dev/null
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      pushd "$istio_tmp" >/dev/null
+      curl -sL "https://github.com/istio/istio/releases/download/${ISTIO_VERSION}/istio-${ISTIO_VERSION}-win.zip" -o istio.zip
+      unzip -q istio.zip
+      popd >/dev/null
+      ;;
+    *)
+      curl -sL https://istio.io/downloadIstio | ISTIO_VERSION=$ISTIO_VERSION TARGET_ARCH=x86_64 sh - -d "$istio_tmp" >/dev/null
+      ;;
+  esac
   export PATH="$istio_tmp/istio-$ISTIO_VERSION/bin:$PATH"
 fi
 if [ -z "$ISTIO_DIR" ]; then
@@ -446,6 +503,10 @@ EOF
 
   "$ISTIO_DIR/samples/multicluster/gen-eastwest-gateway.sh" --network "network${index}" \
     | istioctl --context "$cluster" install -y -f -
+
+  # Scale east-west gateway to 2 replicas so its PDB (minAvailable=1) doesn't
+  # block node drains during cluster upgrades. See docs/upstream-issues.md #6.
+  kubectl --context "$cluster" -n istio-system scale deploy istio-eastwestgateway --replicas=2 >/dev/null 2>&1 || true
 
   kubectl --context "$cluster" apply -n istio-system -f \
     "$ISTIO_DIR/samples/multicluster/expose-services.yaml"
