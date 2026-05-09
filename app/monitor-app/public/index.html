@@ -148,6 +148,34 @@
     .badge.replica { background: var(--cp-accent-soft); color: var(--cp-accent); }
     .badge.healthy { background: rgba(22,163,74,0.12); color: var(--cp-success); }
     .badge.unhealthy { background: rgba(220,38,38,0.12); color: var(--cp-danger); }
+    .badge.warn { background: rgba(245,158,11,0.16); color: var(--cp-warning); }
+    .write-banner {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 16px;
+      border-radius: 0.625rem;
+      margin-bottom: 12px;
+      border: 1px solid var(--cp-border);
+      background: var(--cp-surface);
+      font-size: 14px;
+      color: var(--cp-text);
+    }
+    .write-banner.ready { border-color: rgba(22,163,74,0.4); background: rgba(22,163,74,0.06); }
+    .write-banner.failover { border-color: rgba(245,158,11,0.5); background: rgba(245,158,11,0.08); }
+    .write-banner.down { border-color: rgba(220,38,38,0.5); background: rgba(220,38,38,0.08); }
+    .write-banner .dot {
+      width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+    }
+    .write-banner.ready .dot { background: var(--cp-success); }
+    .write-banner.failover .dot { background: var(--cp-warning); animation: pulse 1.2s infinite; }
+    .write-banner.down .dot { background: var(--cp-danger); }
+    .write-banner .reason { color: var(--cp-text-muted); font-size: 12px; margin-left: 4px; }
+    .write-banner .timer { color: var(--cp-text-soft); font-size: 12px; font-family: Consolas, "Courier New", Courier, monospace; margin-left: auto; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
     .row {
       display: flex;
       justify-content: space-between;
@@ -399,6 +427,7 @@
   </nav>
   <main>
     <section id="pane-topology" class="pane active">
+      <div id="topologyBanner" class="write-banner"></div>
       <div id="meta" class="meta-bar"></div>
       <div id="error"></div>
       <div id="grid" class="grid"></div>
@@ -411,6 +440,7 @@
       </div>
     </section>
     <section id="pane-data" class="pane">
+      <div id="bookingsBanner" class="write-banner"></div>
       <div class="meta-bar" style="margin-bottom:12px;">
         <div>Add a booking on the global primary; watch it stream to the replica via Postgres physical replication.</div>
       </div>
@@ -462,21 +492,129 @@
   <script>
     const $ = (id) => document.getElementById(id);
     let timer = null;
+    let lastWriteState = null;
+    let writeStateChangedAt = Date.now();
 
     function fmt(v) { return v == null || v === "" ? "—" : v; }
+
+    // Single source of truth for "can the demo accept writes right now?".
+    // Returns { state: 'ready' | 'failover' | 'down', primary, reason }.
+    // Mirrors the server's checkReplicationHealthy logic plus the cluster-level
+    // signals we already have in /api/status.
+    function getWriteStatus(data) {
+      if (!data || !Array.isArray(data.clusters)) {
+        return { state: "down", primary: null, reason: "no cluster data yet" };
+      }
+      const primary = data.clusters.find((c) => c.role === "PRIMARY");
+      if (!primary) {
+        return { state: "down", primary: null, reason: "no PRIMARY elected" };
+      }
+      const rep = data.replicationHealthy || { ok: false, reason: "checking" };
+      if (rep.ok) {
+        return { state: "ready", primary: primary.context, reason: "" };
+      }
+      // Distinguish "transient failover-in-progress" from "broken / needs intervention".
+      const r = String(rep.reason || "").toLowerCase();
+      const isFailoverTransient =
+        /waiting for the instances/i.test(primary.phase || "") ||
+        /setting up primary/i.test(primary.phase || "") ||
+        /promotion/i.test(primary.phase || "") ||
+        /wal receiver/i.test(r) ||
+        /primary has no currentprimary/i.test(r) ||
+        /primary .* is /i.test(r);
+      const isStaleToken = /stale promotiontoken/i.test(r) || /promotion token/i.test(primary.phaseReason || "");
+      if (isStaleToken && !/healthy/i.test(primary.phase || "")) {
+        return { state: "failover", primary: primary.context, reason: rep.reason };
+      }
+      if (isFailoverTransient) {
+        return { state: "failover", primary: primary.context, reason: rep.reason };
+      }
+      // Primary phase reports unhealthy and it's not the standard failover dance.
+      return { state: "down", primary: primary.context, reason: rep.reason };
+    }
+
+    function fmtElapsed(ms) {
+      const s = Math.max(0, Math.floor(ms / 1000));
+      const mm = String(Math.floor(s / 60)).padStart(2, "0");
+      const ss = String(s % 60).padStart(2, "0");
+      return `${mm}:${ss}`;
+    }
+
+    function renderWriteBanner(elId, status) {
+      const el = $(elId);
+      if (!el) return;
+      el.classList.remove("ready", "failover", "down");
+      el.classList.add(status.state);
+      let label, sub = "";
+      const since = Date.now() - writeStateChangedAt;
+      if (status.state === "ready") {
+        label = `Cross-cloud replication healthy — writes accepted on <strong>${status.primary}</strong>`;
+      } else if (status.state === "failover") {
+        label = `Failover in progress — do <strong>NOT</strong> write yet`;
+        sub = status.reason ? `<span class="reason">${status.reason}</span>` : "";
+      } else {
+        label = `No writeable primary available`;
+        sub = status.reason ? `<span class="reason">${status.reason}</span>` : "";
+      }
+      const timer = (status.state === "failover" || status.state === "down")
+        ? `<span class="timer">${fmtElapsed(since)}</span>`
+        : "";
+      el.innerHTML = `<span class="dot"></span><span>${label}</span>${sub}${timer}`;
+    }
+
+    function applyWriteGate(status) {
+      const blocked = status.state !== "ready";
+      const tip = blocked
+        ? `Writes blocked: ${status.reason || "failover in progress"}. Wait for the green banner.`
+        : "";
+      ["insertBtn", "batchBtn", "seedBtn"].forEach((id) => {
+        const btn = $(id);
+        if (!btn) return;
+        // Don't fight in-flight per-button disables (those use .dataset.busy="1")
+        if (btn.dataset.busy === "1") return;
+        btn.disabled = blocked;
+        btn.title = blocked ? tip : btn.dataset.origTitle || "";
+      });
+    }
+
+    function updateWriteStatusUI(data) {
+      const status = getWriteStatus(data);
+      if (status.state !== lastWriteState) {
+        lastWriteState = status.state;
+        writeStateChangedAt = Date.now();
+      }
+      renderWriteBanner("topologyBanner", status);
+      renderWriteBanner("bookingsBanner", status);
+      applyWriteGate(status);
+    }
 
     function renderClusters(data) {
       const grid = $("grid");
       grid.innerHTML = "";
       const others = data.clusters.filter((c) => c.role !== "PRIMARY").map((c) => c.context);
       const repHealth = data.replicationHealthy || { ok: false, reason: "unknown" };
+      const writeStatus = getWriteStatus(data);
 
       data.clusters.forEach((c) => {
         const card = document.createElement("div");
         card.className = "card";
-        const healthBadge = c.healthy
-          ? `<span class="badge healthy">Healthy</span>`
-          : `<span class="badge unhealthy">${fmt(c.phaseReason) || "Unhealthy"}</span>`;
+        // For the PRIMARY card, the truthful status is "can it accept writes",
+        // not just "is the cluster phase healthy". writeStatus already
+        // combines both signals (phase + WAL receiver streaming).
+        let healthBadge;
+        if (c.role === "PRIMARY") {
+          if (writeStatus.state === "ready") {
+            healthBadge = `<span class="badge healthy">Writeable</span>`;
+          } else if (writeStatus.state === "failover") {
+            healthBadge = `<span class="badge warn" title="${(writeStatus.reason || "").replace(/"/g, "&quot;")}">Failover in progress</span>`;
+          } else {
+            healthBadge = `<span class="badge unhealthy" title="${(writeStatus.reason || "").replace(/"/g, "&quot;")}">${fmt(c.phaseReason) || "Unhealthy"}</span>`;
+          }
+        } else {
+          healthBadge = c.healthy
+            ? `<span class="badge healthy">Healthy</span>`
+            : `<span class="badge unhealthy">${fmt(c.phaseReason) || "Unhealthy"}</span>`;
+        }
         const roleBadge = c.role === "PRIMARY"
           ? `<span class="badge primary">Primary</span>`
           : `<span class="badge replica">Replica</span>`;
@@ -567,6 +705,7 @@
         lastTopology = j;
         renderMeta(j);
         renderClusters(j);
+        updateWriteStatusUI(j);
         $("lastRefresh").textContent = new Date(j.ts).toLocaleTimeString();
       } catch (err) {
         $("error").innerHTML = `<div class="err">${err.message}</div>`;
@@ -1055,21 +1194,35 @@ db.listings.aggregate([
     }
 
     $("insertBtn").addEventListener("click", async () => {
+      const status = getWriteStatus(lastTopology);
+      if (status.state !== "ready") {
+        $("dataError").innerHTML = `<div class="err">Writes blocked — ${status.reason || "failover in progress"}. Wait for the green banner.</div>`;
+        return;
+      }
+      $("insertBtn").dataset.busy = "1";
       $("insertBtn").disabled = true;
       try {
         await insertBooking(randomBooking(), 1);
       } finally {
+        $("insertBtn").dataset.busy = "0";
         $("insertBtn").disabled = false;
       }
     });
 
     $("batchBtn").addEventListener("click", async () => {
+      const status = getWriteStatus(lastTopology);
+      if (status.state !== "ready") {
+        $("dataError").innerHTML = `<div class="err">Writes blocked — ${status.reason || "failover in progress"}. Wait for the green banner.</div>`;
+        return;
+      }
+      $("batchBtn").dataset.busy = "1";
       $("batchBtn").disabled = true;
       try {
         for (let i = 0; i < 10; i++) {
           await insertBooking(randomBooking(), 1);
         }
       } finally {
+        $("batchBtn").dataset.busy = "0";
         $("batchBtn").disabled = false;
       }
     });
@@ -1097,6 +1250,12 @@ db.listings.aggregate([
     });
 
     $("seedBtn").addEventListener("click", async () => {
+      const status = getWriteStatus(lastTopology);
+      if (status.state !== "ready") {
+        $("dataError").innerHTML = `<div class="err">Writes blocked — ${status.reason || "failover in progress"}. Wait for the green banner.</div>`;
+        return;
+      }
+      $("seedBtn").dataset.busy = "1";
       $("seedBtn").disabled = true;
       try {
         const r = await fetch("/api/data/seed", { method: "POST" });
@@ -1104,6 +1263,7 @@ db.listings.aggregate([
         if (!j.ok) $("dataError").innerHTML = `<div class="err">${j.error}</div>`;
         else { $("dataError").innerHTML = ""; await initialLoad(); }
       } finally {
+        $("seedBtn").dataset.busy = "0";
         $("seedBtn").disabled = false;
       }
     });
