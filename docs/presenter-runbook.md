@@ -28,6 +28,12 @@ app (`app/monitor-app/`).
 - [ ] `OPENAI_API_KEY` exported in the shell you''ll use for the vector demo
 - [ ] kubectl contexts `azure-documentdb`, `aws-documentdb`, and `hub`
       configured
+- [ ] **AWS SSO logged in** within the last hour: `aws sso login` (token
+      lifetime is 8-12h but SSO requires a browser handshake; if it expires
+      mid-demo the monitor app's PRIMARY badge will flip to amber
+      "Failover in progress" because `kubectl --context aws-documentdb`
+      cannot reach the cluster). Verify with
+      `kubectl --context aws-documentdb -n documentdb-preview-ns get cluster`.
 - [ ] Monitor app running (`app/monitor-app/start.ps1`) - open
       <http://localhost:5174> on a second screen
 
