@@ -860,7 +860,7 @@ db.listings.aggregate([
     function commitRender() {
       if (!lastTopology) return;
       const contexts = lastTopology.clusters.map((c) => c.context);
-      const merged = contexts.map((c) => latestPerCtx.get(c) || { ok: false, context: c, rows: [] });
+      const merged = contexts.map((c) => latestPerCtx.get(c) || { ok: false, context: c, rows: [], loading: true });
       renderDataPanes(merged, lastTopology.primary);
     }
 
@@ -960,6 +960,8 @@ db.listings.aggregate([
         let bodyHtml = "";
         if (res.notSeeded) {
           bodyHtml = `<div style="padding:24px;text-align:center;color:var(--cp-text-muted);">Bookings table not seeded yet — click <strong>Seed sample bookings</strong> above.</div>`;
+        } else if (res.loading) {
+          bodyHtml = `<div style="padding:24px;text-align:center;color:var(--cp-text-muted);">Loading…</div>`;
         } else if (!res.ok) {
           bodyHtml = `<div class="err">${res.error || "error"}</div>`;
         } else if (rowCount === 0) {
