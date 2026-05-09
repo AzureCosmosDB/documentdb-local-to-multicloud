@@ -494,8 +494,12 @@
         const promoteBtn = c.role !== "PRIMARY"
           ? `<button class="primary" data-promote="${c.context}" ${promoteDisabled ? "disabled" : ""} title="${promoteTitle.replace(/"/g, "&quot;")}">Promote to primary</button>`
           : "";
-        const fixTokenBtn = !c.healthy && /promotion token/i.test(c.phaseReason || "")
-          ? `<button class="danger" data-fix="${c.context}">Clear stale token</button>`
+        const hasStaleToken = !c.healthy && /promotion token/i.test(c.phaseReason || "");
+        const fixTokenBtn = hasStaleToken
+          ? `<button class="danger" data-fix="${c.context}" title="Remove the stale promotionToken from spec.replica. Use this if you want the operator to retry without forcing promotion.">Clear stale token</button>`
+          : "";
+        const forcePromoteBtn = hasStaleToken
+          ? `<button class="primary" data-force-promote="${c.context}" title="Read this cluster's local promotion-token ConfigMap (its actual current WAL position) and stamp it onto spec.replica.promotionToken + set replica.primary=self. Use this when both clusters are stuck after a failed failover.">Force-promote (local token)</button>`
           : "";
         // Rebuild button is always available on the replica — most useful
         // when WAL-timeline divergence has stalled streaming, but harmless
@@ -523,7 +527,7 @@
           ${c.phaseReason && !c.healthy ? `<div class="reason">${c.phaseReason}</div>` : ""}
           ${replWarn}
           ${replRows}
-          <div class="actions">${promoteBtn}${fixTokenBtn}${rebuildBtn}</div>
+          <div class="actions">${promoteBtn}${forcePromoteBtn}${fixTokenBtn}${rebuildBtn}</div>
         `;
         grid.appendChild(card);
       });
@@ -533,6 +537,9 @@
       );
       grid.querySelectorAll("button[data-fix]").forEach((b) =>
         b.addEventListener("click", () => clearToken(b.dataset.fix))
+      );
+      grid.querySelectorAll("button[data-force-promote]").forEach((b) =>
+        b.addEventListener("click", () => forcePromoteLocal(b.dataset.forcePromote))
       );
       grid.querySelectorAll("button[data-rebuild]").forEach((b) =>
         b.addEventListener("click", () => rebuildReplica(b.dataset.rebuild))
@@ -631,6 +638,29 @@
       });
       const j = await r.json();
       appendLog(JSON.stringify(j, null, 2) + "\n");
+      refresh();
+    }
+
+    async function forcePromoteLocal(ctx) {
+      if (!confirm(
+        `Force-promote ${ctx} using its OWN local promotion token?\n\n` +
+        `This will:\n` +
+        `  • Set ${ctx} as the primary (replica.primary = self)\n` +
+        `  • Stamp the local promotion-token ConfigMap onto spec.replica.promotionToken\n` +
+        `  • Cause CNPG to promote pod-1 in place against its actual WAL position\n\n` +
+        `Use this only when ${ctx} is stuck "unrecoverable" with reason ` +
+        `"Promotion token content is not correct for current instance".\n\n` +
+        `After it succeeds you will likely need to Rebuild the OTHER cluster as a fresh replica.\n\nProceed?`
+      )) return;
+      appendLog(`>>> POST /api/force-promote-local-token context=${ctx}\n`);
+      const r = await fetch("/api/force-promote-local-token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ context: ctx }),
+      });
+      const j = await r.json();
+      appendLog(JSON.stringify(j, null, 2) + "\n");
+      if (!j.ok) alert(`Force-promote failed: ${j.error || "unknown error"}`);
       refresh();
     }
 

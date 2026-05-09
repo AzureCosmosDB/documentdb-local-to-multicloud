@@ -360,6 +360,91 @@ async function clearStaleTokenHandler(req, res) {
 app.post("/api/clear-token", clearStaleTokenHandler);
 app.post("/api/clear-stale-token", clearStaleTokenHandler);
 
+// Force-promote a CNPG cluster using its OWN current promotion-token. This is
+// the recovery path for the failure mode where a failover left this side
+// "unrecoverable" with phaseReason "Promotion token content is not correct
+// for current instance" — i.e. the operator stamped a stale cross-cloud token
+// onto spec.replica.promotionToken that references a WAL position the local
+// data is no longer at (because timeline diverged).
+//
+// What this endpoint does:
+//   1. Read the local `promotion-token` ConfigMap (the sidecar that exposes
+//      this region's current checkpoint over HTTP at /index.html).
+//   2. Patch spec.replica.primary = self  (so CNPG knows we are the primary).
+//   3. Patch spec.replica.promotionToken = <local token>  (matches our data).
+// CNPG then promotes pod-1 in place against the timeline it actually has.
+//
+// This is destructive at the topology level (it makes this cluster the
+// primary) so it requires confirmation from the UI.
+app.post("/api/force-promote-local-token", async (req, res) => {
+  const ctx = String(req.body?.context || "");
+  if (!MEMBER_CONTEXTS.includes(ctx)) {
+    return res.status(400).json({ ok: false, error: `context must be one of ${MEMBER_CONTEXTS.join(", ")}` });
+  }
+  try {
+    const c = await findCNPGCluster(ctx);
+    if (!c?.metadata?.name) {
+      return res.status(404).json({ ok: false, error: `no CNPG cluster found in ${ctx}` });
+    }
+    const cnpgName = c.metadata.name;
+
+    // 1. Fetch the local promotion-token ConfigMap (sidecar exposes it at
+    //    data["index.html"]). This is the cluster's own current checkpoint.
+    const cmOut = await kubectl([
+      "--context", ctx, "-n", NAMESPACE,
+      "get", "cm", "promotion-token",
+      "-o", "jsonpath={.data.index\\.html}",
+    ]);
+    if (cmOut.code !== 0 || !cmOut.stdout?.trim()) {
+      return res.status(500).json({
+        ok: false,
+        error: `could not read local promotion-token ConfigMap in ${ctx}: ${cmOut.stderr || cmOut.stdout || "empty"}`,
+      });
+    }
+    const localToken = cmOut.stdout.trim();
+
+    // 2 + 3. Single merge patch: set this cluster as its own primary AND
+    //        set the promotionToken to its local value.
+    const patch = JSON.stringify({
+      spec: { replica: { primary: cnpgName, promotionToken: localToken } },
+    });
+    const patched = await kubectl([
+      "--context", ctx, "-n", NAMESPACE,
+      "patch", "cluster.postgresql.cnpg.io", cnpgName,
+      "--type=merge", "-p", patch,
+    ]);
+    if (patched.code !== 0) {
+      return res.status(500).json({
+        ok: false,
+        error: patched.stderr || patched.stdout || "patch failed",
+      });
+    }
+
+    invalidatePrimaryCtxCache();
+    // Background warm — give CNPG a few seconds to promote, then prime caches
+    // so the UI starts seeing reads against the new primary quickly.
+    (async () => {
+      try {
+        await new Promise((r) => setTimeout(r, 30000));
+        await getMongoDb(ctx).catch(() => {});
+        await refreshListingsCache(ctx).catch(() => {});
+        console.log(`[warm] post force-promote warmed caches for ${ctx}`);
+      } catch (err) {
+        console.warn(`[warm] force-promote warm failed for ${ctx}: ${err.message || err}`);
+      }
+    })();
+
+    res.json({
+      ok: true,
+      cluster: cnpgName,
+      tokenLength: localToken.length,
+      message: `Patched ${cnpgName}: replica.primary=self + replica.promotionToken=<local>. CNPG should promote pod-1 in place within ~30s. Watch /api/status.`,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
 // Rebuild a replica cluster from scratch by deleting its CNPG Cluster
 // resource. The DocumentDB hub operator reconciles within a few seconds and
 // re-creates the cluster, which triggers a fresh pg_basebackup from the
