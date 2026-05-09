@@ -354,12 +354,54 @@ app.post("/api/promote", async (req, res) => {
   res.json({ ok: out.code === 0, stdout: out.stdout, stderr: out.stderr });
 });
 
+// Build a CNPG-compatible promotionToken JSON directly from the cluster's
+// own pg_control_checkpoint() / pg_control_system() output. This is the
+// reliable path for the post-rebuild case where the operator's sidecar CM
+// (`<cluster>-promotion-token`) is missing or stale — the source of truth
+// is always the live PostgreSQL control file. Returns the base64-encoded
+// token suitable for spec.replica.promotionToken, or null on failure.
+async function buildPromotionTokenFromPgControl(ctx, cnpgName) {
+  const sql =
+    "SELECT json_build_object(" +
+    "'tl',timeline_id," +
+    "'wal',redo_wal_file," +
+    "'lsn',redo_lsn," +
+    "'sid',system_identifier," +
+    "'cptime',to_char(checkpoint_time AT TIME ZONE 'UTC','FMDy Mon DD HH24:MI:SS YYYY')" +
+    ") FROM pg_control_checkpoint(),pg_control_system();";
+  const r = await kubectl([
+    "--context", ctx, "-n", NAMESPACE,
+    "exec", `${cnpgName}-1`, "-c", "postgres", "--",
+    "psql", "-U", "postgres", "-tAc", sql,
+  ]);
+  if (r.code !== 0 || !r.stdout?.trim()) return null;
+  let j;
+  try { j = JSON.parse(r.stdout.trim()); } catch { return null; }
+  // CNPG/operator timeOfLatestCheckpoint format is asctime-style with a
+  // space-padded day-of-month (e.g. "Sat May  9 17:17:45 2026").
+  const parts = String(j.cptime).split(" ").filter(Boolean);
+  if (parts.length < 4) return null;
+  const day = parseInt(parts[2], 10);
+  const dayPad = day < 10 ? ` ${day}` : `${day}`;
+  const cptime = `${parts[0]} ${parts[1]} ${dayPad} ${parts.slice(3).join(" ")}`;
+  const tokenObj = {
+    latestCheckpointTimelineID: String(j.tl),
+    redoWalFile: String(j.wal),
+    databaseSystemIdentifier: String(j.sid),
+    latestCheckpointREDOLocation: String(j.lsn),
+    timeOfLatestCheckpoint: cptime,
+    operatorVersion: "1.28.0",
+  };
+  return Buffer.from(JSON.stringify(tokenObj), "utf8").toString("base64");
+}
+
 // Workaround for documentdb/documentdb-kubernetes-operator#375: after a
 // promote the operator may leave the new primary stuck in "unrecoverable"
 // with a stale promotionToken. Poll for that state for ~3 minutes and, if
-// detected, repeatedly stamp the cluster's own current local promotion-token
-// (from the sidecar ConfigMap) onto spec.replica until CNPG accepts it and
-// the cluster transitions to healthy.
+// detected, repeatedly stamp a freshly-built promotion token (sourced from
+// the cluster's own pg_control_checkpoint() — NOT the sidecar CM, which
+// can be stale or absent right after a rebuild) onto spec.replica until
+// CNPG accepts it and the cluster transitions to healthy.
 async function healStaleTokenIfNeeded(ctx) {
   const deadline = Date.now() + 3 * 60 * 1000;
   let cnpgName = null;
@@ -380,12 +422,7 @@ async function healStaleTokenIfNeeded(ctx) {
     }
     if (/unrecoverable/i.test(phase) && /promotion token/i.test(reason)) {
       try {
-        const cmOut = await kubectl([
-          "--context", ctx, "-n", NAMESPACE,
-          "get", "cm", "promotion-token",
-          "-o", "jsonpath={.data.index\\.html}",
-        ]);
-        const localToken = cmOut.stdout?.trim();
+        const localToken = await buildPromotionTokenFromPgControl(ctx, cnpgName);
         if (localToken) {
           const patch = JSON.stringify({
             spec: { replica: { primary: cnpgName, promotionToken: localToken } },
@@ -397,12 +434,12 @@ async function healStaleTokenIfNeeded(ctx) {
           ]);
           if (r.code === 0) {
             healed = true;
-            console.log(`[heal:${ctx}] stamped local promotionToken (len=${localToken.length}) onto ${cnpgName}`);
+            console.log(`[heal:${ctx}] stamped fresh promotionToken (len=${localToken.length}) onto ${cnpgName}`);
           } else {
             console.warn(`[heal:${ctx}] patch failed: ${r.stderr || r.stdout}`);
           }
         } else {
-          console.warn(`[heal:${ctx}] local promotion-token CM empty, cannot heal yet`);
+          console.warn(`[heal:${ctx}] could not build promotion token from pg_control_checkpoint, will retry`);
         }
       } catch (err) {
         console.warn(`[heal:${ctx}] error: ${err.message || err}`);
