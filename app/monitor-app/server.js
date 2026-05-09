@@ -1085,6 +1085,17 @@ app.listen(PORT, () => {
       } catch (err) {
         console.warn(`[warm] mongo/listings warm failed for ${ctx}: ${err.message || err}`);
       }
+      // Also pre-warm replica Mongo gateways in parallel so the Bookings tab
+      // does not pay a 5-10s cold start when the user first switches to it.
+      const replicas = MEMBER_CONTEXTS.filter((c) => c !== ctx);
+      await Promise.all(replicas.map(async (rctx) => {
+        try {
+          await getMongoDb(rctx);
+          console.log(`[warm] mongo primed for replica ${rctx}`);
+        } catch (err) {
+          console.warn(`[warm] mongo warm failed for replica ${rctx}: ${err.message || err}`);
+        }
+      }));
     })
     .catch((err) => console.warn(`[warm] primary context warm failed: ${err.message || err}`));
 });
