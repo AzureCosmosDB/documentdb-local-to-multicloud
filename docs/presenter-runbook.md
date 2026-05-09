@@ -577,6 +577,61 @@ for full setup. This section is the on-stage script.
   > sync profile. You shouldn't normally need the manual patch, but the
   > snippets above are the ground truth if the auto-reconcile is disabled.
 
+- **New primary stuck `unrecoverable` with `Promotion token content is not
+  correct for current instance` (upstream bug
+  [documentdb/documentdb-kubernetes-operator#375](https://github.com/documentdb/documentdb-kubernetes-operator/issues/375)).**
+  The operator's cross-cloud promote handshake captures the source-side
+  promotion token at moment T and stamps it onto the target's
+  `spec.replica.promotionToken`. After any prior failover the timelines
+  have diverged, so CNPG rejects the token and parks the cluster as
+  `unrecoverable`. The operator does not retry or back off.
+  - **Auto-recovery (built into `/api/promote`).** After firing the promote,
+    the handler now spawns a background healer (`healStaleTokenIfNeeded`)
+    that polls the new primary for up to 3 minutes. If it sees the
+    unrecoverable + stale-token state, it reads the *new primary's* own
+    promotion-token ConfigMap (`<cluster>-promotion-token`, key
+    `index.html` -- yes, really) and repeatedly stamps that local token
+    onto `spec.replica.promotionToken` until CNPG accepts it (typically
+    1-3 retries). You should usually not need to touch this on stage.
+  - **Manual fallback (the red panic chain).** If the auto-heal hasn't
+    cleared things within ~60s:
+    1. Click the **Force-promote (local token)** button that appears on
+       the unrecoverable cluster's card. This calls
+       `/api/force-promote-local-token` which does the same patch as the
+       healer but in one shot.
+    2. If that returns ok but the cluster still doesn't recover, the
+       local CM is itself stale (separate sidecar bug -- the CM doesn't
+       refresh after the cluster has been rebuilt). Click **Rebuild
+       replica** on the *current* primary candidate so it bootstraps
+       fresh from `pg_basebackup`, wait ~3-5 min for it to come up
+       healthy, then re-attempt the failover. The freshly-bootstrapped
+       cluster will have a current CM token.
+    3. Worst case, the same recovery sequence works from the CLI (each
+       step is one of the API endpoints above):
+       ```bash
+       # 1. flip hub primary
+       kubectl --context hub -n documentdb-preview-ns patch documentdb \
+         documentdb-preview --type=merge \
+         -p '{"spec":{"clusterReplication":{"primary":"<NEW>-documentdb"}}}'
+       # 2. read NEW's local promotion token, stamp onto its own spec.replica
+       TOK=$(kubectl --context <NEW> -n documentdb-preview-ns get cm \
+         <cnpg-cluster>-promotion-token -o jsonpath='{.data.index\.html}')
+       kubectl --context <NEW> -n documentdb-preview-ns patch \
+         cluster.postgresql.cnpg.io <cnpg-cluster> --type=merge \
+         -p "{\"spec\":{\"replica\":{\"promotionToken\":\"$TOK\"}}}"
+       # 3. clear once accepted
+       kubectl --context <NEW> -n documentdb-preview-ns patch \
+         cluster.postgresql.cnpg.io <cnpg-cluster> --type=json \
+         -p '[{"op":"remove","path":"/spec/replica/promotionToken"}]'
+       # 4. rebuild OLD as fresh replica
+       kubectl --context <OLD> -n documentdb-preview-ns delete \
+         cluster.postgresql.cnpg.io <cnpg-cluster>
+       ```
+  - **Tracking.** A scheduled Clawpilot automation watches issue #375 daily
+    and pings me when there's maintainer activity. When the upstream fix
+    lands, rip out `healStaleTokenIfNeeded` and the force-promote button
+    -- they are workarounds, not the architecture.
+
 - **Replica gets stuck after rapid back-to-back failovers (WAL timeline
   divergence).** Symptom: the new replica's `pg_stat_wal_receiver` shows
   no rows (or `status != 'streaming'`), and the pod logs contain something
