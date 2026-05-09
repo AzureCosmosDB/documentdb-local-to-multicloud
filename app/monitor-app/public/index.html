@@ -468,8 +468,10 @@
 
     // Single source of truth for "can the demo accept writes right now?".
     // Returns { state: 'ready' | 'failover' | 'down', primary, reason }.
-    // Mirrors the server's checkReplicationHealthy logic plus the cluster-level
-    // signals we already have in /api/status.
+    // The TRUE signal is data.writeProbe — server actually attempted a write
+    // against the primary's MongoDB gateway. replicationHealthy can briefly
+    // be ok=true while CNPG is mid-promotion and writes still fail, so we
+    // only flip to "ready" when BOTH replicationHealthy AND writeProbe agree.
     function getWriteStatus(data) {
       if (!data || !Array.isArray(data.clusters)) {
         return { state: "down", primary: null, reason: "no cluster data yet" };
@@ -479,8 +481,20 @@
         return { state: "down", primary: null, reason: "no PRIMARY elected" };
       }
       const rep = data.replicationHealthy || { ok: false, reason: "checking" };
-      if (rep.ok) {
+      const probe = data.writeProbe || { ok: false, reason: "no probe yet" };
+      // Ready ONLY when both replication is healthy and the server's actual
+      // upsert against the primary succeeded.
+      if (rep.ok && probe.ok) {
         return { state: "ready", primary: primary.context, reason: "" };
+      }
+      // If probe failed but replication says ok, we're in the dangerous
+      // "looks healthy but writes fail" window. Treat as failover-in-progress.
+      if (rep.ok && !probe.ok) {
+        return {
+          state: "failover",
+          primary: primary.context,
+          reason: `Verifying writes — ${probe.reason || "probe failed"}`,
+        };
       }
       const r = String(rep.reason || "").toLowerCase();
       const isFailoverTransient =

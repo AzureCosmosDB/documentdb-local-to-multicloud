@@ -158,6 +158,12 @@ app.get("/api/status", async (_req, res) => {
     // rapid back-to-back promotions and produces split-brain divergence).
     const replicationHealthy = await checkReplicationHealthy(clusters);
 
+    // Write probe: actually attempt a tiny upsert against the current
+    // primary's MongoDB-compatible gateway. This is the ground truth for
+    // "is this cluster writeable RIGHT NOW" — replicationHealthy can briefly
+    // return ok=true when CNPG is mid-promotion and writes still fail.
+    const writeProbe = await checkWriteProbe(primary);
+
     res.json({
       ok: true,
       ts: new Date().toISOString(),
@@ -170,6 +176,7 @@ app.get("/api/status", async (_req, res) => {
       clusters,
       members: clusters,
       replicationHealthy,
+      writeProbe,
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err.message || err) });
@@ -191,19 +198,6 @@ let _replHealthCache = { value: null, expiresAt: 0, key: null };
 const REPL_HEALTH_TTL_MS = 10_000;
 
 async function checkReplicationHealthy(clusters) {
-  const key = clusters
-    .map((c) => `${c.context}:${c.role}:${c.healthy}:${c.promotionToken}:${c.currentPrimary || ""}`)
-    .sort().join("|");
-  const now = Date.now();
-  if (_replHealthCache.key === key && _replHealthCache.expiresAt > now) {
-    return _replHealthCache.value;
-  }
-  const result = await _checkReplicationHealthyImpl(clusters);
-  _replHealthCache = { value: result, expiresAt: now + REPL_HEALTH_TTL_MS, key };
-  return result;
-}
-
-async function _checkReplicationHealthyImpl(clusters) {
   try {
     const primary = clusters.find((c) => c.role === "PRIMARY");
     const replica = clusters.find((c) => c.role === "REPLICA");
@@ -236,6 +230,62 @@ async function _checkReplicationHealthyImpl(clusters) {
   } catch (err) {
     return { ok: false, reason: `health probe error: ${err.message || err}` };
   }
+}
+
+// Write probe: idempotent upsert against the primary's MongoDB-compatible
+// gateway. Ground truth for "writes will succeed RIGHT NOW". Cached for 3s
+// so /api/status (5s poll) stays cheap. The probe doc has a fixed _id so
+// repeated probes do not grow the collection.
+const PROBE_COLL = "_writeprobe";
+const PROBE_ID = "monitor-app-probe";
+let _writeProbeCache = { value: null, expiresAt: 0, key: null };
+const WRITE_PROBE_TTL_MS = 3_000;
+const WRITE_PROBE_TIMEOUT_MS = 4_000;
+
+async function checkWriteProbe(primaryCtx) {
+  const now = Date.now();
+  const key = primaryCtx || "";
+  if (_writeProbeCache.key === key && _writeProbeCache.expiresAt > now) {
+    return _writeProbeCache.value;
+  }
+  let value;
+  try {
+    if (!primaryCtx) {
+      value = { ok: false, reason: "no primary context", checkedAt: now };
+    } else {
+      const db = await Promise.race([
+        getMongoDb(primaryCtx),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("mongo connect timeout")), WRITE_PROBE_TIMEOUT_MS)),
+      ]);
+      const ts = new Date();
+      const writePromise = db.collection(PROBE_COLL).updateOne(
+        { _id: PROBE_ID },
+        { $set: { ts, ctx: primaryCtx } },
+        { upsert: true },
+      );
+      const r = await Promise.race([
+        writePromise,
+        new Promise((_, rej) => setTimeout(() => rej(new Error("write timeout")), WRITE_PROBE_TIMEOUT_MS)),
+      ]);
+      value = {
+        ok: true,
+        primary: primaryCtx,
+        latencyMs: Date.now() - now,
+        checkedAt: now,
+        upsertedId: r.upsertedId ? String(r.upsertedId) : null,
+      };
+    }
+  } catch (err) {
+    value = {
+      ok: false,
+      primary: primaryCtx,
+      reason: String(err.message || err).slice(0, 200),
+      latencyMs: Date.now() - now,
+      checkedAt: now,
+    };
+  }
+  _writeProbeCache = { value, expiresAt: now + WRITE_PROBE_TTL_MS, key };
+  return value;
 }
 
 // Reconciles the new primary CNPG cluster after a failover:
@@ -366,7 +416,7 @@ async function buildPromotionTokenFromPgControl(ctx, cnpgName) {
     "'tl',timeline_id," +
     "'wal',redo_wal_file," +
     "'lsn',redo_lsn," +
-    "'sid',system_identifier," +
+    "'sid',system_identifier::text," +
     "'cptime',to_char(checkpoint_time AT TIME ZONE 'UTC','FMDy Mon DD HH24:MI:SS YYYY')" +
     ") FROM pg_control_checkpoint(),pg_control_system();";
   const r = await kubectl([
@@ -403,12 +453,17 @@ async function buildPromotionTokenFromPgControl(ctx, cnpgName) {
 // can be stale or absent right after a rebuild) onto spec.replica until
 // CNPG accepts it and the cluster transitions to healthy.
 async function healStaleTokenIfNeeded(ctx) {
-  const deadline = Date.now() + 3 * 60 * 1000;
+  const deadline = Date.now() + 6 * 60 * 1000;
   let cnpgName = null;
   let healed = false;
+  let cycle = 0;
+  let healthyHits = 0; // require sustained healthy + writes work before exit
+  console.log(`[heal:${ctx}] starting (window=6min)`);
   while (Date.now() < deadline) {
+    cycle++;
     const c = await findCNPGCluster(ctx).catch(() => null);
     if (!c?.metadata?.name) {
+      console.log(`[heal:${ctx}] cycle ${cycle}: no CNPG cluster yet, retrying`);
       await new Promise((r) => setTimeout(r, 5000));
       continue;
     }
@@ -417,9 +472,22 @@ async function healStaleTokenIfNeeded(ctx) {
     const reason = c.status?.phaseReason || "";
     const isHealthy = /healthy/i.test(phase) && c.status?.readyInstances === c.status?.instances;
     if (isHealthy) {
-      if (healed) console.log(`[heal:${ctx}] cluster healthy after token heal`);
-      return;
+      // The operator may stamp a bad promotionToken AFTER we first see
+      // "healthy" — exiting early lets that bug slip through. Require writes
+      // to actually succeed via the write probe before we declare done.
+      const probe = await checkWriteProbe(ctx).catch(() => ({ ok: false, reason: "probe error" }));
+      healthyHits = probe.ok ? healthyHits + 1 : 0;
+      console.log(`[heal:${ctx}] cycle ${cycle}: healthy phase, probe.ok=${probe.ok} (${probe.reason || `${probe.latencyMs}ms`}) hits=${healthyHits}`);
+      if (healthyHits >= 2) {
+        if (healed) console.log(`[heal:${ctx}] cycle ${cycle}: cluster healthy + writes confirmed after token heal — done`);
+        else console.log(`[heal:${ctx}] cycle ${cycle}: cluster healthy + writes confirmed — exit`);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 8000));
+      continue;
     }
+    console.log(`[heal:${ctx}] cycle ${cycle}: phase="${phase}" reason="${reason}" ready=${c.status?.readyInstances}/${c.status?.instances}`);
+    healthyHits = 0;
     if (/unrecoverable/i.test(phase) && /promotion token/i.test(reason)) {
       try {
         const localToken = await buildPromotionTokenFromPgControl(ctx, cnpgName);
@@ -434,20 +502,20 @@ async function healStaleTokenIfNeeded(ctx) {
           ]);
           if (r.code === 0) {
             healed = true;
-            console.log(`[heal:${ctx}] stamped fresh promotionToken (len=${localToken.length}) onto ${cnpgName}`);
+            console.log(`[heal:${ctx}] cycle ${cycle}: stamped fresh promotionToken (len=${localToken.length}) onto ${cnpgName}`);
           } else {
-            console.warn(`[heal:${ctx}] patch failed: ${r.stderr || r.stdout}`);
+            console.warn(`[heal:${ctx}] cycle ${cycle}: patch failed: ${r.stderr || r.stdout}`);
           }
         } else {
-          console.warn(`[heal:${ctx}] could not build promotion token from pg_control_checkpoint, will retry`);
+          console.warn(`[heal:${ctx}] cycle ${cycle}: could not build promotion token from pg_control_checkpoint, will retry`);
         }
       } catch (err) {
-        console.warn(`[heal:${ctx}] error: ${err.message || err}`);
+        console.warn(`[heal:${ctx}] cycle ${cycle}: error: ${err.message || err}`);
       }
     }
     await new Promise((r) => setTimeout(r, 10000));
   }
-  console.warn(`[heal:${ctx}] gave up waiting for cluster to heal after 3 minutes`);
+  console.warn(`[heal:${ctx}] gave up waiting for cluster to heal after 6 minutes`);
 }
 
 async function clearStaleTokenHandler(req, res) {
@@ -494,20 +562,19 @@ app.post("/api/force-promote-local-token", async (req, res) => {
     }
     const cnpgName = c.metadata.name;
 
-    // 1. Fetch the local promotion-token ConfigMap (sidecar exposes it at
-    //    data["index.html"]). This is the cluster's own current checkpoint.
-    const cmOut = await kubectl([
-      "--context", ctx, "-n", NAMESPACE,
-      "get", "cm", "promotion-token",
-      "-o", "jsonpath={.data.index\\.html}",
-    ]);
-    if (cmOut.code !== 0 || !cmOut.stdout?.trim()) {
+    // Build promotionToken from the cluster's LIVE pg_control_checkpoint().
+    // The `promotion-token` ConfigMap (maintained by the operator's sidecar)
+    // can lag behind reality after a failover round-trip — using it here is
+    // the source of issue #375 recurring even after a "force-promote-local-
+    // token". Reading directly from pg_control_checkpoint() guarantees the
+    // token matches the data on disk.
+    const localToken = await buildPromotionTokenFromPgControl(ctx, cnpgName);
+    if (!localToken) {
       return res.status(500).json({
         ok: false,
-        error: `could not read local promotion-token ConfigMap in ${ctx}: ${cmOut.stderr || cmOut.stdout || "empty"}`,
+        error: `could not build promotion token from pg_control_checkpoint() in ${ctx}`,
       });
     }
-    const localToken = cmOut.stdout.trim();
 
     // 2 + 3. Single merge patch: set this cluster as its own primary AND
     //        set the promotionToken to its local value.
