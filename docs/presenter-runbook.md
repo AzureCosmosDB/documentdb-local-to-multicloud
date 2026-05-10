@@ -504,18 +504,43 @@ Talking points:
 
 ## J) Cross-cloud failover demo (live monitor app)
 
-This is the optional "big red button" failover demo at the end of the
+This is the "big red button" failover demo at the end of the
 multi-cloud segment. The app lives in `app/monitor-app/` - see its README
 for full setup. This section is the on-stage script.
 
-**Prereqs (do this before going on stage):**
+> **DO ONE FAILOVER ON STAGE. Do not fail back live.**
+>
+> Postgres physical replication forks the WAL timeline on every promote.
+> After a single bidirectional swap (A->B->A), the demoted side cannot
+> resume streaming - it needs a `pg_basebackup` rebuild (~3-4 min). That
+> is fine off-stage; awful on-stage. Issue
+> [#375](https://github.com/documentdb/documentdb-kubernetes-operator/issues/375)
+> in the operator tracks this.
+>
+> Single failover from your starting primary -> other cloud is rock solid.
+> Pick a starting primary in pre-flight; if it's wrong, do an off-stage
+> failover *before* the talk so the live one points the direction you
+> rehearsed.
+
+**Pre-flight (30 min before stage):**
 
 1. Multi-cloud cluster from `infra/multi-cloud/` is up; `kubectl documentdb`
    plugin on PATH.
-2. `bookingsdb.listings` loaded on AKS primary (replicated to EKS).
-3. `app/monitor-app/start.ps1` running (server :5174). The app spawns its
+2. `aws sso login --sso-session cosmos` - the SSO token expires every
+   ~12 hours.
+3. `bookingsdb.listings` loaded on the desired starting primary
+   (replicated to the other cloud).
+4. `app/monitor-app/start.ps1` running (server :5174). The app spawns its
    own kubectl port-forwards to each gateway - no manual port-forward
    terminals needed.
+5. Open <http://localhost:5174>: confirm both clusters green 3/3, the
+   correct cloud shows PRIMARY/Writeable, and the **Bookings** tab
+   loads (cold start can take ~10s on first visit; visit it now so it's
+   warm).
+6. Click **Reset (drop bookings)** then **Seed sample bookings** to
+   leave a clean baseline.
+7. (If your starting primary is on the wrong cloud) do one off-stage
+   failover *now* so the live demo runs in the direction you rehearsed.
 
 **On-stage flow (~3 min):**
 
