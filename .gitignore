@@ -24,3 +24,5 @@ data/*_vectors.json.bak*
 # Vendored operator chart tarballs (large; pulled fresh by deploy.sh)
 infra/multi-cloud/*.tgz
 
+
+.scratch/

@@ -393,6 +393,13 @@ app.post("/api/promote", async (req, res) => {
           await new Promise((r) => setTimeout(r, 4000));
         }
         await healStaleTokenIfNeeded(ctx);
+        // Proactive cleanup per research: even on a "clean" promote the
+        // operator leaves spec.replica.promotionToken set. Each subsequent
+        // reconcile re-validates it against an advancing pg_controldata, so
+        // it WILL go stale within minutes and trip #375 on the next cycle.
+        // Remove it now while we're healthy so the cluster stays stable.
+        await removeLingeringPromotionToken(ctx).catch((e) =>
+          console.warn(`[post-heal:${ctx}] token cleanup failed: ${e.message || e}`));
         await getMongoDb(ctx);
         await refreshListingsCache(ctx);
         console.log(`[warm] re-primed mongo + listings cache for new primary ${ctx}`);
@@ -452,6 +459,26 @@ async function buildPromotionTokenFromPgControl(ctx, cnpgName) {
 // the cluster's own pg_control_checkpoint() — NOT the sidecar CM, which
 // can be stale or absent right after a rebuild) onto spec.replica until
 // CNPG accepts it and the cluster transitions to healthy.
+async function removeLingeringPromotionToken(ctx) {
+  const c = await findCNPGCluster(ctx).catch(() => null);
+  if (!c?.metadata?.name) return;
+  if (!c?.spec?.replica?.promotionToken) {
+    console.log(`[post-heal:${ctx}] no lingering promotionToken on ${c.metadata.name}`);
+    return;
+  }
+  const r = await kubectl([
+    "--context", ctx, "-n", NAMESPACE,
+    "patch", "cluster.postgresql.cnpg.io", c.metadata.name,
+    "--type=json",
+    `-p=[{"op":"remove","path":"/spec/replica/promotionToken"}]`,
+  ]);
+  if (r.code === 0) {
+    console.log(`[post-heal:${ctx}] removed lingering promotionToken from ${c.metadata.name}`);
+  } else {
+    console.warn(`[post-heal:${ctx}] token remove failed: ${r.stderr || r.stdout}`);
+  }
+}
+
 async function healStaleTokenIfNeeded(ctx) {
   const deadline = Date.now() + 6 * 60 * 1000;
   let cnpgName = null;
@@ -489,25 +516,32 @@ async function healStaleTokenIfNeeded(ctx) {
     console.log(`[heal:${ctx}] cycle ${cycle}: phase="${phase}" reason="${reason}" ready=${c.status?.readyInstances}/${c.status?.instances}`);
     healthyHits = 0;
     if (/unrecoverable/i.test(phase) && /promotion token/i.test(reason)) {
+      // PER RESEARCH (.scratch/research-issue-375.md): the actual bug is that
+      // the operator never clears spec.replica.promotionToken after a
+      // successful promote. Each reconcile re-validates the token against
+      // pg_controldata which has advanced past it, eventually returning the
+      // non-retryable TokenVerificationError -> phase=Unrecoverable.
+      //
+      // The supported workaround (per issue #375 itself) is to REMOVE the
+      // token, not rebuild it. CNPG then stops re-validating and the cluster
+      // re-converges. Building a replacement token from pg_control is a red
+      // herring — even a perfectly-correct token will fall stale within
+      // seconds because the live primary keeps advancing the WAL.
       try {
-        const localToken = await buildPromotionTokenFromPgControl(ctx, cnpgName);
-        if (localToken) {
-          const patch = JSON.stringify({
-            spec: { replica: { primary: cnpgName, promotionToken: localToken } },
-          });
-          const r = await kubectl([
-            "--context", ctx, "-n", NAMESPACE,
-            "patch", "cluster.postgresql.cnpg.io", cnpgName,
-            "--type=merge", "-p", patch,
-          ]);
-          if (r.code === 0) {
-            healed = true;
-            console.log(`[heal:${ctx}] cycle ${cycle}: stamped fresh promotionToken (len=${localToken.length}) onto ${cnpgName}`);
-          } else {
-            console.warn(`[heal:${ctx}] cycle ${cycle}: patch failed: ${r.stderr || r.stdout}`);
-          }
+        const r = await kubectl([
+          "--context", ctx, "-n", NAMESPACE,
+          "patch", "cluster.postgresql.cnpg.io", cnpgName,
+          "--type=json",
+          `-p=[{"op":"remove","path":"/spec/replica/promotionToken"}]`,
+        ]);
+        if (r.code === 0) {
+          healed = true;
+          console.log(`[heal:${ctx}] cycle ${cycle}: removed stale promotionToken from ${cnpgName} (issue #375 workaround)`);
+        } else if (/not found/i.test(r.stderr || "")) {
+          // Token already absent — nothing to remove. Cluster will converge on its own.
+          console.log(`[heal:${ctx}] cycle ${cycle}: no promotionToken present, waiting for cluster to converge`);
         } else {
-          console.warn(`[heal:${ctx}] cycle ${cycle}: could not build promotion token from pg_control_checkpoint, will retry`);
+          console.warn(`[heal:${ctx}] cycle ${cycle}: token-remove patch failed: ${r.stderr || r.stdout}`);
         }
       } catch (err) {
         console.warn(`[heal:${ctx}] cycle ${cycle}: error: ${err.message || err}`);
