@@ -703,10 +703,18 @@ let _primaryCtxCache = { value: null, expiresAt: 0 };
 async function getGlobalPrimaryContext() {
   const now = Date.now();
   if (_primaryCtxCache.expiresAt > now && _primaryCtxCache.value) return _primaryCtxCache.value;
-  const ddb = await getDocumentDB();
-  const v = ddb.spec?.clusterReplication?.primary || null;
-  _primaryCtxCache = { value: v, expiresAt: now + 60000 };
-  return v;
+  try {
+    const ddb = await getDocumentDB();
+    const v = ddb.spec?.clusterReplication?.primary || null;
+    _primaryCtxCache = { value: v, expiresAt: now + 300000 };
+    return v;
+  } catch (err) {
+    if (_primaryCtxCache.value) {
+      _primaryCtxCache.expiresAt = now + 30000;
+      return _primaryCtxCache.value;
+    }
+    throw err;
+  }
 }
 function invalidatePrimaryCtxCache() { _primaryCtxCache = { value: null, expiresAt: 0 }; }
 

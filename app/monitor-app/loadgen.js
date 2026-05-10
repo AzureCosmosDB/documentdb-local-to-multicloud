@@ -227,7 +227,17 @@ class LoadGen {
   async _opDetail(db) {
     if (this.listingsSample.length === 0) return;
     const listing = pickRandom(this.listingsSample);
-    await db.collection("listings").findOne({ _id: listing._id });
+    // Avoid findOne({_id}): on partitioned listings collections the router
+    // can fail with "trying to open a pruned relation" depending on how _id
+    // was generated at seed time. The slug field `id` (or displayName as a
+    // fallback) is what real booking-site detail pages actually use.
+    const filter = listing.id
+      ? { id: listing.id }
+      : { displayName: listing.displayName || listing.name };
+    await db.collection("listings")
+      .find(filter, { projection: { displayName: 1, city: 1, country: 1, price: 1, description: 1 } })
+      .limit(1)
+      .toArray();
   }
 
   async _opInsert(db) {
