@@ -1,0 +1,18 @@
+# PeerAuthentication: allow Prometheus (no istio sidecar) to scrape
+# CNPG metrics on :9187 in plaintext, while keeping mTLS for app traffic.
+#
+# Apply with --context aws-documentdb AND --context azure-documentdb.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: cnpg-metrics-permissive
+  namespace: documentdb-preview-ns
+spec:
+  selector:
+    matchLabels:
+      cnpg.io/podRole: instance
+  mtls:
+    mode: STRICT
+  portLevelMtls:
+    "9187":
+      mode: PERMISSIVE

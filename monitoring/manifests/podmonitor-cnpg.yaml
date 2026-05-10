@@ -1,0 +1,35 @@
+# PodMonitor for the CloudNativePG postgres metrics exporter.
+# CNPG exposes metrics on container port 9187 (named "metrics") on every
+# postgres pod. We scrape both primary and replicas and label the
+# instance role so dashboards can filter on it.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: cnpg-cluster
+  namespace: documentdb-preview-ns
+  labels:
+    release: prom-stack
+spec:
+  selector:
+    matchLabels:
+      cnpg.io/podRole: instance
+  podMetricsEndpoints:
+    - port: metrics
+      interval: 5s
+      scrapeTimeout: 4s
+      honorLabels: true
+      relabelings:
+        # Promote the cnpg cluster + instance + role labels into top-level series labels.
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_label_cnpg_io_cluster]
+          targetLabel: cnpg_cluster
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_label_cnpg_io_instanceName]
+          targetLabel: instance_name
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_label_cnpg_io_instanceRole]
+          targetLabel: instance_role
+        # Stamp every series with the cloud (set per-cluster via external label on the Prometheus).
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node

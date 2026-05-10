@@ -83,6 +83,8 @@
     }
     h1 { margin: 0; font-size: 20px; font-weight: 600; }
     .subtitle { color: var(--cp-text-muted); font-size: 13px; margin-top: 4px; }
+    .failover-timer { color: var(--cp-text-muted); font-size: 11px; opacity: 0.65; font-variant-numeric: tabular-nums; margin-top: 2px; }
+    .failover-timer strong { font-weight: 600; color: var(--cp-text-soft); }
     main { padding: 24px 32px; max-width: 1400px; margin: 0 auto; }
     .toolbar {
       display: flex;
@@ -397,6 +399,7 @@
     <button class="tab active" data-tab="topology">Topology</button>
     <button class="tab" data-tab="data">Bookings</button>
     <button class="tab" data-tab="vector">Vector Search</button>
+    <button class="tab" data-tab="load">Load</button>
   </nav>
   <main>
     <section id="pane-topology" class="pane active">
@@ -459,6 +462,62 @@
 <pre id="vsPipeline" style="background:var(--cp-surface-soft);border:1px solid var(--cp-border);border-radius:6px;padding:10px;font:12px Consolas,monospace;overflow-x:auto;color:var(--cp-text);"></pre>
       </details>
     </section>
+
+    <section id="pane-load" class="pane">
+      <div class="meta-bar" style="margin-bottom:12px;">
+        <div>Drives a realistic travel-booking traffic mix against the <strong>current primary</strong> via the Mongo gateway. Reads hit <code>bookingsdb.listings</code>; writes go to a separate <code>bookingsdb.loadgen_bookings</code> collection so the Bookings tab demo stays clean.</div>
+      </div>
+      <div class="toolbar" style="gap:14px;flex-wrap:wrap;align-items:center;">
+        <label style="display:flex;align-items:center;gap:10px;">
+          <span style="font-weight:600;min-width:84px;">Target RPS</span>
+          <input id="lgRps" type="range" min="0" max="500" step="1" value="50" style="width:240px;" />
+          <span id="lgRpsVal" style="font-family:Consolas,monospace;min-width:42px;text-align:right;">50</span>
+        </label>
+        <div style="display:flex;gap:6px;">
+          <button class="lg-preset" data-rps="0">Idle (0)</button>
+          <button class="lg-preset" data-rps="20">Morning (20)</button>
+          <button class="lg-preset" data-rps="100">Peak (100)</button>
+          <button class="lg-preset" data-rps="350">Black Friday (350)</button>
+        </div>
+        <div style="margin-left:auto;display:flex;gap:6px;">
+          <button id="lgStart" class="primary">Start</button>
+          <button id="lgStop">Stop</button>
+          <button id="lgReset" title="Drop loadgen_bookings on primary">Drop loadgen_bookings</button>
+        </div>
+      </div>
+
+      <div style="font-size:12px;color:var(--cp-text-muted);margin:10px 2px;">
+        Mix (% of operations): browse listings → detail lookup → insert booking → confirm booking
+      </div>
+      <div class="toolbar" style="gap:14px;flex-wrap:wrap;">
+        <label>Browse <input id="mixBrowse" type="number" min="0" max="100" value="80" style="width:60px;" /></label>
+        <label>Detail <input id="mixDetail" type="number" min="0" max="100" value="15" style="width:60px;" /></label>
+        <label>Insert <input id="mixInsert" type="number" min="0" max="100" value="4"  style="width:60px;" /></label>
+        <label>Update <input id="mixUpdate" type="number" min="0" max="100" value="1"  style="width:60px;" /></label>
+      </div>
+
+      <div id="lgError"></div>
+
+      <div class="grid" style="margin-top:14px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));">
+        <div class="card"><h3>Status</h3><div id="lgStatus" style="font-size:22px;font-weight:600;">stopped</div></div>
+        <div class="card"><h3>Observed RPS (60s)</h3><div id="lgObsRps" style="font-size:22px;font-weight:600;">0</div></div>
+        <div class="card"><h3>Latency p50</h3><div id="lgP50" style="font-size:22px;font-weight:600;">— ms</div></div>
+        <div class="card"><h3>Latency p95</h3><div id="lgP95" style="font-size:22px;font-weight:600;">— ms</div></div>
+        <div class="card"><h3>Latency p99</h3><div id="lgP99" style="font-size:22px;font-weight:600;">— ms</div></div>
+        <div class="card"><h3>Uptime</h3><div id="lgUptime" style="font-size:22px;font-weight:600;">0s</div></div>
+      </div>
+
+      <h3 style="margin:18px 0 6px;">Per-operation totals</h3>
+      <table id="lgOpTable" style="width:100%;border-collapse:collapse;font-size:13px;">
+        <thead><tr style="text-align:left;border-bottom:1px solid var(--cp-border);">
+          <th style="padding:6px 8px;">Operation</th>
+          <th style="padding:6px 8px;text-align:right;">Count</th>
+          <th style="padding:6px 8px;text-align:right;">Errors</th>
+          <th style="padding:6px 8px;text-align:right;">Avg ms</th>
+        </tr></thead>
+        <tbody id="lgOpBody"></tbody>
+      </table>
+    </section>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
@@ -497,6 +556,26 @@
         };
       }
       const r = String(rep.reason || "").toLowerCase();
+      // When primary phase is healthy AND the only complaint is "no WAL
+      // receiver on replica", the replica's WAL has forked from the
+      // primary's timeline (issue #375). Promote will not recover this —
+      // the replica needs a pg_basebackup rebuild. Surface this as a
+      // distinct state so the UI can prompt the right action instead of
+      // sitting on "Failover in progress" forever.
+      const allMembersPhaseHealthy = data.clusters.every((c) =>
+        /healthy/i.test(c.phase || "")
+      );
+      const isWalReceiverDown = /wal receiver is not running/i.test(r) ||
+        /wal receiver/i.test(r);
+      if (allMembersPhaseHealthy && isWalReceiverDown) {
+        const replica = data.clusters.find((c) => c.role !== "PRIMARY");
+        return {
+          state: "rebuild-required",
+          primary: primary.context,
+          replica: replica ? replica.context : null,
+          reason: rep.reason,
+        };
+      }
       const isFailoverTransient =
         /waiting for the instances/i.test(primary.phase || "") ||
         /setting up primary/i.test(primary.phase || "") ||
@@ -531,6 +610,9 @@
         if (c.role === "PRIMARY") {
           if (writeStatus.state === "ready") {
             healthBadge = `<span class="badge healthy">Writeable</span>`;
+          } else if (writeStatus.state === "rebuild-required") {
+            const target = writeStatus.replica ? writeStatus.replica : "the replica card";
+            healthBadge = `<span class="badge unhealthy" title="${(writeStatus.reason || "").replace(/"/g, "&quot;")}">Replica rebuild required — click Rebuild replica on ${target}</span>`;
           } else if (writeStatus.state === "failover") {
             healthBadge = `<span class="badge warn" title="${(writeStatus.reason || "").replace(/"/g, "&quot;")}">Failover in progress</span>`;
           } else {
@@ -616,6 +698,7 @@
         <div><strong>Hub:</strong> ${data.hubContext}</div>
         <div><strong>Primary:</strong> ${data.primary}</div>
         <div><strong>Cross-cloud transport:</strong> ${data.crossCloudNetworkingStrategy || "—"}</div>
+        ${failoverTimerHtml()}
       `;
     }
 
@@ -629,6 +712,7 @@
         }
         $("error").innerHTML = "";
         lastTopology = j;
+        maybeFinishFailoverTimer(j);
         renderMeta(j);
         renderClusters(j);
         $("lastRefresh").textContent = new Date(j.ts).toLocaleTimeString();
@@ -646,6 +730,7 @@
 
     async function promote(target) {
       if (!confirm(`Promote ${target} to primary? This may take ~1 minute.`)) return;
+      startFailoverTimer(target);
       $("logBody").textContent = "";
       appendLog(`>>> POST /api/promote target=${target}\n`);
       const r = await fetch("/api/promote", {
@@ -756,8 +841,99 @@
         document.getElementById(`pane-${btn.dataset.tab}`).classList.add("active");
         if (btn.dataset.tab === "data") initialLoad();
         if (btn.dataset.tab === "vector") initVectorSearch();
+        if (btn.dataset.tab === "load") initLoadTab();
       });
     });
+
+    // ---------- Load generator tab ----------
+    let loadInited = false;
+    let loadPollTimer = null;
+    function initLoadTab() {
+      if (!loadInited) {
+        loadInited = true;
+        const rps = $("lgRps");
+        rps.addEventListener("input", () => { $("lgRpsVal").textContent = rps.value; });
+        document.querySelectorAll(".lg-preset").forEach((b) => {
+          b.addEventListener("click", () => {
+            rps.value = b.dataset.rps;
+            $("lgRpsVal").textContent = b.dataset.rps;
+            // If running, apply immediately by re-starting
+            fetch("/api/loadgen/status").then((r) => r.json()).then((j) => {
+              if (j.status?.running) startLoad();
+            });
+          });
+        });
+        $("lgStart").addEventListener("click", startLoad);
+        $("lgStop").addEventListener("click", async () => {
+          await fetch("/api/loadgen/stop", { method: "POST" });
+          refreshLoadStatus();
+        });
+        $("lgReset").addEventListener("click", async () => {
+          if (!confirm("Drop loadgen_bookings on the current primary?")) return;
+          const r = await fetch("/api/loadgen/reset-collection", { method: "POST" });
+          const j = await r.json();
+          if (!j.ok) {
+            $("lgError").innerHTML = `<div style="color:var(--cp-danger);padding:8px;">Reset failed: ${j.error}</div>`;
+          } else {
+            $("lgError").innerHTML = "";
+          }
+        });
+      }
+      if (!loadPollTimer) {
+        refreshLoadStatus();
+        loadPollTimer = setInterval(refreshLoadStatus, 1000);
+      }
+    }
+
+    async function startLoad() {
+      const rps = parseInt($("lgRps").value, 10);
+      const mix = {
+        browse: parseInt($("mixBrowse").value, 10) || 0,
+        detail: parseInt($("mixDetail").value, 10) || 0,
+        insert: parseInt($("mixInsert").value, 10) || 0,
+        update: parseInt($("mixUpdate").value, 10) || 0,
+      };
+      try {
+        const r = await fetch("/api/loadgen/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ rps, mix }),
+        });
+        const j = await r.json();
+        if (!j.ok) {
+          $("lgError").innerHTML = `<div style="color:var(--cp-danger);padding:8px;">Start failed: ${j.error}</div>`;
+        } else {
+          $("lgError").innerHTML = "";
+        }
+        refreshLoadStatus();
+      } catch (err) {
+        $("lgError").innerHTML = `<div style="color:var(--cp-danger);padding:8px;">${err.message}</div>`;
+      }
+    }
+
+    async function refreshLoadStatus() {
+      try {
+        const r = await fetch("/api/loadgen/status");
+        const j = await r.json();
+        const s = j.status || {};
+        $("lgStatus").textContent = s.running ? `running @ ${s.rps} RPS` : "stopped";
+        $("lgStatus").style.color = s.running ? "var(--cp-success)" : "var(--cp-text-muted)";
+        $("lgObsRps").textContent = s.observed_rps ?? 0;
+        $("lgP50").textContent = (s.latency_p50_ms ?? 0) + " ms";
+        $("lgP95").textContent = (s.latency_p95_ms ?? 0) + " ms";
+        $("lgP99").textContent = (s.latency_p99_ms ?? 0) + " ms";
+        $("lgUptime").textContent = (s.uptime_sec ?? 0) + "s";
+        const tbody = $("lgOpBody");
+        tbody.innerHTML = (s.by_op || []).map((o) => `
+          <tr style="border-bottom:1px solid var(--cp-border);">
+            <td style="padding:6px 8px;text-transform:capitalize;">${o.op}</td>
+            <td style="padding:6px 8px;text-align:right;font-family:Consolas,monospace;">${o.count.toLocaleString()}</td>
+            <td style="padding:6px 8px;text-align:right;font-family:Consolas,monospace;color:${o.errors ? "var(--cp-danger)" : "inherit"};">${o.errors.toLocaleString()}</td>
+            <td style="padding:6px 8px;text-align:right;font-family:Consolas,monospace;">${o.avg_ms}</td>
+          </tr>
+        `).join("");
+      } catch (_) { /* swallow transient */ }
+    }
 
     // ---------- Vector search tab ----------
     let vectorInited = false;
@@ -855,6 +1031,56 @@ db.listings.aggregate([
     // ---------- Data replication tab ----------
 
     let lastTopology = null;
+
+    // Discreet failover timer.
+    // Tracks elapsed time from promote click → primary cluster reaches
+    // writeStatus.state === "ready". Survives page refresh via sessionStorage.
+    const FAILOVER_TIMER_KEY = "ddbFailoverTimer";
+    function loadFailoverTimer() {
+      try {
+        return JSON.parse(sessionStorage.getItem(FAILOVER_TIMER_KEY) || "null") || {};
+      } catch { return {}; }
+    }
+    function saveFailoverTimer(o) {
+      try { sessionStorage.setItem(FAILOVER_TIMER_KEY, JSON.stringify(o || {})); } catch {}
+    }
+    function startFailoverTimer(target) {
+      const t = loadFailoverTimer();
+      t.startMs = Date.now();
+      t.target = target;
+      saveFailoverTimer(t);
+    }
+    function maybeFinishFailoverTimer(data) {
+      const t = loadFailoverTimer();
+      if (!t || !t.startMs || !t.target) return;
+      if (data && data.primary === t.target) {
+        const ws = getWriteStatus(data);
+        if (ws && ws.state === "ready") {
+          t.lastMs = Date.now() - t.startMs;
+          t.lastTarget = t.target;
+          delete t.startMs;
+          delete t.target;
+          saveFailoverTimer(t);
+        }
+      }
+    }
+    function fmtFailoverDuration(ms) {
+      if (!Number.isFinite(ms) || ms <= 0) return "—";
+      const s = Math.round(ms / 1000);
+      if (s < 60) return `${s}s`;
+      return `${Math.floor(s / 60)}m ${s % 60}s`;
+    }
+    function failoverTimerHtml() {
+      const t = loadFailoverTimer();
+      if (t && t.startMs && t.target) {
+        const elapsed = Date.now() - t.startMs;
+        return `<div class="failover-timer">Failover → ${t.target}: <strong>${fmtFailoverDuration(elapsed)}</strong> (running)</div>`;
+      }
+      if (t && Number.isFinite(t.lastMs)) {
+        return `<div class="failover-timer">Last failover → ${t.lastTarget || "primary"}: <strong>${fmtFailoverDuration(t.lastMs)}</strong></div>`;
+      }
+      return "";
+    }
     const seenIds = new Map();   // ctx -> Set of ids previously seen
     const insertTimings = new Map(); // id -> { serverReceivedMs, replicaLagMs, measuringReplica }
     const latestPerCtx = new Map(); // ctx -> latest result from /api/data/list
@@ -1120,10 +1346,19 @@ db.listings.aggregate([
       return j;
     }
 
+    function writesBlockedHtml(status) {
+      if (status && status.state === "rebuild-required") {
+        const target = status.replica ? status.replica : "the replica card";
+        return `<div class="err">Writes blocked — replica WAL has forked. Click <strong>Rebuild replica</strong> on ${target} on the Topology tab. (~3–4 min to recover.)</div>`;
+      }
+      const reason = (status && status.reason) || "failover in progress";
+      return `<div class="err">Writes blocked — ${reason}. Wait for the green banner.</div>`;
+    }
+
     $("insertBtn").addEventListener("click", async () => {
       const status = getWriteStatus(lastTopology);
       if (status.state !== "ready") {
-        $("dataError").innerHTML = `<div class="err">Writes blocked — ${status.reason || "failover in progress"}. Wait for the green banner.</div>`;
+        $("dataError").innerHTML = writesBlockedHtml(status);
         return;
       }
       $("insertBtn").dataset.busy = "1";
@@ -1139,7 +1374,7 @@ db.listings.aggregate([
     $("batchBtn").addEventListener("click", async () => {
       const status = getWriteStatus(lastTopology);
       if (status.state !== "ready") {
-        $("dataError").innerHTML = `<div class="err">Writes blocked — ${status.reason || "failover in progress"}. Wait for the green banner.</div>`;
+        $("dataError").innerHTML = writesBlockedHtml(status);
         return;
       }
       $("batchBtn").dataset.busy = "1";
@@ -1179,7 +1414,7 @@ db.listings.aggregate([
     $("seedBtn").addEventListener("click", async () => {
       const status = getWriteStatus(lastTopology);
       if (status.state !== "ready") {
-        $("dataError").innerHTML = `<div class="err">Writes blocked — ${status.reason || "failover in progress"}. Wait for the green banner.</div>`;
+        $("dataError").innerHTML = writesBlockedHtml(status);
         return;
       }
       $("seedBtn").dataset.busy = "1";

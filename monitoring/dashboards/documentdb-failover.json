@@ -1,0 +1,159 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Cluster role (this cloud)",
+      "id": 1,
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "PRIMARY", "color": "green" } } },
+            { "type": "value", "options": { "1": { "text": "REPLICA", "color": "blue" } } }
+          ],
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }, { "color": "green", "value": 0 }] }
+        }
+      },
+      "targets": [
+        { "expr": "pg_wal_position_in_recovery{pg_target=\"primary\"}", "legendFormat": "{{cloud}}", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "WAL position (primary, MB)",
+      "id": 2,
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value" },
+      "fieldConfig": { "defaults": { "unit": "decmbytes", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } } },
+      "targets": [
+        { "expr": "pg_wal_position_lsn_bytes{pg_target=\"primary\"} / 1024 / 1024", "legendFormat": "primary", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "App DB size (MB)",
+      "id": 3,
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value" },
+      "fieldConfig": { "defaults": { "unit": "decmbytes", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] } } },
+      "targets": [
+        { "expr": "pg_database_stats_size_bytes{datname=\"app\",pg_target=\"primary\"} / 1024 / 1024", "legendFormat": "app", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Active backends (primary)",
+      "id": 4,
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 50 }, { "color": "red", "value": 200 }] } } },
+      "targets": [
+        { "expr": "sum(pg_database_stats_numbackends{pg_target=\"primary\"})", "legendFormat": "backends", "refId": "A" }
+      ]
+    },
+
+    {
+      "type": "timeseries",
+      "title": "Replication lag — bytes behind primary (per replica)",
+      "id": 10,
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "lineWidth": 2, "fillOpacity": 10, "gradientMode": "opacity", "drawStyle": "line" },
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] } },
+      "targets": [
+        { "expr": "pg_stat_replication_replay_bytes_behind", "legendFormat": "{{application_name}} ({{sync_state}})", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Replication lag — seconds behind primary",
+      "id": 11,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 10, "drawStyle": "line" }, "color": { "mode": "palette-classic" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] } },
+      "targets": [
+        { "expr": "pg_stat_replication_replay_lag_seconds", "legendFormat": "replay {{application_name}}", "refId": "A" },
+        { "expr": "pg_stat_replication_flush_lag_seconds",  "legendFormat": "flush {{application_name}}",  "refId": "B" }
+      ]
+    },
+
+    {
+      "type": "timeseries",
+      "title": "TPS — commits per second",
+      "id": 20,
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 13 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "fillOpacity": 10, "drawStyle": "line", "stacking": { "mode": "normal" } }, "color": { "mode": "palette-classic" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] } },
+      "targets": [
+        { "expr": "rate(pg_database_stats_xact_commit{pg_target=\"primary\",datname!~\"template.*|postgres\"}[1m])", "legendFormat": "{{datname}} commit", "refId": "A" },
+        { "expr": "rate(pg_database_stats_xact_rollback{pg_target=\"primary\",datname!~\"template.*|postgres\"}[1m])", "legendFormat": "{{datname}} rollback", "refId": "B" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Tuple ops/sec — inserts / updates / deletes (primary)",
+      "id": 21,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 13 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "fillOpacity": 10, "drawStyle": "line" }, "color": { "mode": "palette-classic" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] } },
+      "targets": [
+        { "expr": "rate(pg_database_stats_tup_inserted{pg_target=\"primary\",datname=\"app\"}[1m])", "legendFormat": "insert", "refId": "A" },
+        { "expr": "rate(pg_database_stats_tup_updated{pg_target=\"primary\",datname=\"app\"}[1m])",  "legendFormat": "update", "refId": "B" },
+        { "expr": "rate(pg_database_stats_tup_deleted{pg_target=\"primary\",datname=\"app\"}[1m])",  "legendFormat": "delete", "refId": "C" },
+        { "expr": "rate(pg_database_stats_tup_returned{pg_target=\"primary\",datname=\"app\"}[1m])", "legendFormat": "returned (read)", "refId": "D" }
+      ]
+    },
+
+    {
+      "type": "timeseries",
+      "title": "WAL receiver — bytes received (this cloud's replicas)",
+      "id": 30,
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "lineWidth": 2, "fillOpacity": 10, "drawStyle": "line" }, "color": { "mode": "palette-classic" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "expr": "pg_stat_wal_receiver_latest_end_lsn_bytes", "legendFormat": "{{instance}} ({{status}})", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Connections by state (primary)",
+      "id": 31,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 30, "drawStyle": "line", "stacking": { "mode": "normal" } }, "color": { "mode": "palette-classic" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "expr": "pg_activity_states_connections{pg_target=\"primary\"}", "legendFormat": "{{state}}", "refId": "A" }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "tags": ["documentdb", "techorama", "failover"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "DocumentDB — Failover & Replication",
+  "uid": "documentdb-failover",
+  "version": 1,
+  "weekStart": ""
+}

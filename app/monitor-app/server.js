@@ -26,6 +26,7 @@ const express = require("express");
 const { spawn } = require("child_process");
 const path = require("path");
 const { MongoClient } = require("mongodb");
+const { LoadGen, MAX_RPS } = require("./loadgen");
 try { require("dotenv").config({ path: path.join(__dirname, "..", "..", ".env") }); } catch (_) {}
 
 function required(name) {
@@ -776,7 +777,8 @@ async function getMongoDb(ctx) {
     st.client = new MongoClient(uri, {
       serverSelectionTimeoutMS: 8_000,
       connectTimeoutMS: 8_000,
-      maxPoolSize: 4,
+      maxPoolSize: 32,
+      minPoolSize: 2,
     });
     await st.client.connect();
     st.db = st.client.db(DEMO_DB);
@@ -1045,6 +1047,52 @@ app.post("/api/data/reset", async (_req, res) => {
     const db = await getMongoDb(primaryCtx);
     try {
       await db.collection(BOOKINGS_COLL).drop();
+    } catch (err) {
+      if (!/ns not found|NamespaceNotFound/i.test(String(err.message))) throw err;
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+// ---------- Load generator ----------
+
+const loadgen = new LoadGen({
+  getDbForPrimary: async () => {
+    const ctx = await getGlobalPrimaryContext();
+    if (!ctx) return null;
+    return getMongoDb(ctx);
+  },
+  log: (msg) => console.log(msg),
+});
+
+app.get("/api/loadgen/status", (_req, res) => {
+  res.json({ ok: true, status: loadgen.status(), max_rps: MAX_RPS });
+});
+
+app.post("/api/loadgen/start", async (req, res) => {
+  try {
+    const rps = Number(req.body?.rps);
+    const mix = req.body?.mix;
+    const status = await loadgen.start({ rps, mix });
+    res.json({ ok: true, status });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+app.post("/api/loadgen/stop", (_req, res) => {
+  res.json({ ok: true, status: loadgen.stop() });
+});
+
+app.post("/api/loadgen/reset-collection", async (_req, res) => {
+  try {
+    const primaryCtx = await getGlobalPrimaryContext();
+    if (!primaryCtx) return res.status(503).json({ ok: false, error: "no primary" });
+    const db = await getMongoDb(primaryCtx);
+    try {
+      await db.collection("loadgen_bookings").drop();
     } catch (err) {
       if (!/ns not found|NamespaceNotFound/i.test(String(err.message))) throw err;
     }

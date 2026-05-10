@@ -1,0 +1,297 @@
+---
+# Permit plaintext scrape on :9187 for the standalone postgres-exporter pods.
+# (The cnpg pods themselves already have a separate PeerAuthentication.)
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: pg-exporter-metrics-permissive
+  namespace: documentdb-preview-ns
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pg-exporter
+  mtls:
+    mode: STRICT
+  portLevelMtls:
+    "9187":
+      mode: PERMISSIVE
+---
+# Credentials Secret — written via SQL on the primary cluster, replicated
+# to standbys via WAL.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pg-exporter-monitor
+  namespace: documentdb-preview-ns
+type: Opaque
+stringData:
+  username: "cnpg_monitor"
+  password: "techorama_monitor_2026"
+---
+# Custom queries that drive the failover dashboard.
+# These run via the standalone postgres-exporter — NOT via CNPG's built-in
+# metric exporter, which is broken on documentdb-bootstrapped clusters
+# (it triggers a permission-denied check inside the documentdb_api_internal
+# schema even for the postgres superuser; documented in our runbook).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pg-exporter-queries
+  namespace: documentdb-preview-ns
+data:
+  queries.yaml: |
+    pg_stat_replication:
+      query: |
+        SELECT application_name
+             , state
+             , sync_state
+             , COALESCE(EXTRACT(EPOCH FROM write_lag),  0) AS write_lag_seconds
+             , COALESCE(EXTRACT(EPOCH FROM flush_lag),  0) AS flush_lag_seconds
+             , COALESCE(EXTRACT(EPOCH FROM replay_lag), 0) AS replay_lag_seconds
+             , COALESCE(pg_wal_lsn_diff(sent_lsn,   replay_lsn), 0) AS replay_bytes_behind
+             , COALESCE(pg_wal_lsn_diff(sent_lsn,   flush_lsn),  0) AS flush_bytes_behind
+             , COALESCE(pg_wal_lsn_diff(sent_lsn,   write_lsn),  0) AS write_bytes_behind
+        FROM pg_catalog.pg_stat_replication
+      master: true
+      metrics:
+        - application_name:    {usage: LABEL, description: "Replica application_name"}
+        - state:               {usage: LABEL, description: "Replication state"}
+        - sync_state:          {usage: LABEL, description: "sync/async/quorum"}
+        - write_lag_seconds:   {usage: GAUGE, description: "Local write -> remote write seconds"}
+        - flush_lag_seconds:   {usage: GAUGE, description: "Local write -> remote flush seconds"}
+        - replay_lag_seconds:  {usage: GAUGE, description: "Local write -> remote replay seconds"}
+        - replay_bytes_behind: {usage: GAUGE, description: "Bytes the replica has not yet replayed"}
+        - flush_bytes_behind:  {usage: GAUGE, description: "Bytes the replica has not yet flushed"}
+        - write_bytes_behind:  {usage: GAUGE, description: "Bytes the replica has not yet written"}
+
+    pg_stat_wal_receiver:
+      query: |
+        SELECT status
+             , COALESCE(pg_wal_lsn_diff(latest_end_lsn, '0/0'), 0)            AS latest_end_lsn_bytes
+             , COALESCE(EXTRACT(EPOCH FROM (now() - latest_end_time)), 0)     AS seconds_since_last_msg
+        FROM pg_catalog.pg_stat_wal_receiver
+      metrics:
+        - status:                  {usage: LABEL, description: "Walreceiver status"}
+        - latest_end_lsn_bytes:    {usage: GAUGE, description: "Last WAL position received from primary, bytes"}
+        - seconds_since_last_msg:  {usage: GAUGE, description: "Seconds since the last walsender message"}
+
+    pg_database_stats:
+      query: |
+        SELECT datname
+             , numbackends
+             , xact_commit
+             , xact_rollback
+             , blks_read
+             , blks_hit
+             , tup_returned
+             , tup_fetched
+             , tup_inserted
+             , tup_updated
+             , tup_deleted
+             , conflicts
+             , temp_files
+             , temp_bytes
+             , deadlocks
+             , pg_database_size(datname) AS size_bytes
+        FROM pg_catalog.pg_stat_database d
+        JOIN pg_database pd USING (datname)
+        WHERE NOT pd.datistemplate
+      metrics:
+        - datname:       {usage: LABEL,   description: "Database name"}
+        - numbackends:   {usage: GAUGE,   description: "Active backends"}
+        - xact_commit:   {usage: COUNTER, description: "Committed transactions"}
+        - xact_rollback: {usage: COUNTER, description: "Rolled-back transactions"}
+        - blks_read:     {usage: COUNTER, description: "Disk blocks read"}
+        - blks_hit:      {usage: COUNTER, description: "Buffer cache hits"}
+        - tup_returned:  {usage: COUNTER, description: "Rows returned"}
+        - tup_fetched:   {usage: COUNTER, description: "Rows fetched (index scans)"}
+        - tup_inserted:  {usage: COUNTER, description: "Rows inserted"}
+        - tup_updated:   {usage: COUNTER, description: "Rows updated"}
+        - tup_deleted:   {usage: COUNTER, description: "Rows deleted"}
+        - conflicts:     {usage: COUNTER, description: "Recovery conflicts"}
+        - temp_files:    {usage: COUNTER, description: "Temp files created"}
+        - temp_bytes:    {usage: COUNTER, description: "Temp bytes written"}
+        - deadlocks:     {usage: COUNTER, description: "Deadlocks detected"}
+        - size_bytes:    {usage: GAUGE,   description: "Database on-disk size"}
+
+    pg_activity_states:
+      query: |
+        WITH states(state) AS (
+          VALUES ('active'), ('idle'), ('idle in transaction'),
+                 ('idle in transaction (aborted)'), ('fastpath function call'),
+                 ('disabled')
+        )
+        SELECT s.state
+             , COALESCE(c.connections, 0)            AS connections
+             , COALESCE(c.max_xact_seconds, 0)       AS max_xact_seconds
+        FROM states s
+        LEFT JOIN (
+          SELECT state
+               , COUNT(*) AS connections
+               , COALESCE(EXTRACT(EPOCH FROM max(now() - xact_start)), 0) AS max_xact_seconds
+          FROM pg_catalog.pg_stat_activity
+          WHERE state IS NOT NULL
+          GROUP BY state
+        ) c USING (state)
+      metrics:
+        - state:            {usage: LABEL, description: "Backend state"}
+        - connections:      {usage: GAUGE, description: "Connections in this state"}
+        - max_xact_seconds: {usage: GAUGE, description: "Longest transaction in this state, seconds"}
+
+    pg_wal_position:
+      query: |
+        SELECT
+          CASE WHEN pg_is_in_recovery()
+               THEN pg_wal_lsn_diff(pg_last_wal_replay_lsn(), '0/0')
+               ELSE pg_wal_lsn_diff(pg_current_wal_lsn(),     '0/0')
+          END                                              AS lsn_bytes,
+          CASE WHEN pg_is_in_recovery() THEN 1 ELSE 0 END  AS in_recovery
+      metrics:
+        - lsn_bytes:    {usage: GAUGE, description: "Current WAL position (or last replay LSN on standby), bytes"}
+        - in_recovery:  {usage: GAUGE, description: "1 if standby, 0 if primary"}
+---
+# Postgres exporter targeting the PRIMARY service (always the writeable node).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-exporter-primary
+  namespace: documentdb-preview-ns
+  labels:
+    app.kubernetes.io/name: pg-exporter
+    pg-exporter-target: primary
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pg-exporter
+      pg-exporter-target: primary
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pg-exporter
+        pg-exporter-target: primary
+      annotations:
+        # Keep istio sidecar so we can speak mTLS to the cnpg :5432 service.
+        sidecar.istio.io/inject: "true"
+    spec:
+      containers:
+        - name: exporter
+          image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+          args:
+            - --extend.query-path=/etc/queries/queries.yaml
+            - --collector.database
+            - --no-collector.stat_bgwriter
+            - --no-collector.stat_user_tables
+            - --no-collector.stat_statements
+            - --web.listen-address=:9187
+          env:
+            - name: DATA_SOURCE_USER
+              valueFrom: { secretKeyRef: { name: pg-exporter-monitor, key: username } }
+            - name: DATA_SOURCE_PASS
+              valueFrom: { secretKeyRef: { name: pg-exporter-monitor, key: password } }
+            - name: DATA_SOURCE_URI
+              # CNPG primary RW service is per-cluster; we resolve it via env
+              # injected by the Service below being a headless one is overkill —
+              # we hardcode the pattern: cluster name encoded in pod label.
+              # For our environment, primary svc is documentdb-preview-{hash}-rw.
+              # We use the ALWAYS-CORRECT trick: query the cnpg label on this pod.
+              # Simpler: have the launcher script substitute. For now, exec a
+              # tiny init that reads the cnpg cluster name from a downward API.
+              value: "_PLACEHOLDER_PRIMARY_HOST_:5432/postgres?sslmode=require"
+          ports:
+            - containerPort: 9187
+              name: metrics
+          readinessProbe:
+            httpGet: { path: /metrics, port: 9187 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 80Mi }
+            limits:   { memory: 200Mi }
+          volumeMounts:
+            - name: queries
+              mountPath: /etc/queries
+      volumes:
+        - name: queries
+          configMap:
+            name: pg-exporter-queries
+---
+# Postgres exporter targeting the READ-ONLY service (random replica).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-exporter-replica
+  namespace: documentdb-preview-ns
+  labels:
+    app.kubernetes.io/name: pg-exporter
+    pg-exporter-target: replica
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pg-exporter
+      pg-exporter-target: replica
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pg-exporter
+        pg-exporter-target: replica
+      annotations:
+        sidecar.istio.io/inject: "true"
+    spec:
+      containers:
+        - name: exporter
+          image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+          args:
+            - --extend.query-path=/etc/queries/queries.yaml
+            - --collector.database
+            - --no-collector.stat_bgwriter
+            - --no-collector.stat_user_tables
+            - --no-collector.stat_statements
+            - --web.listen-address=:9187
+          env:
+            - name: DATA_SOURCE_USER
+              valueFrom: { secretKeyRef: { name: pg-exporter-monitor, key: username } }
+            - name: DATA_SOURCE_PASS
+              valueFrom: { secretKeyRef: { name: pg-exporter-monitor, key: password } }
+            - name: DATA_SOURCE_URI
+              value: "_PLACEHOLDER_REPLICA_HOST_:5432/postgres?sslmode=require"
+          ports:
+            - containerPort: 9187
+              name: metrics
+          readinessProbe:
+            httpGet: { path: /metrics, port: 9187 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 80Mi }
+            limits:   { memory: 200Mi }
+          volumeMounts:
+            - name: queries
+              mountPath: /etc/queries
+      volumes:
+        - name: queries
+          configMap:
+            name: pg-exporter-queries
+---
+# PodMonitor for both exporters — labelled targets become role=primary / role=replica.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: pg-exporter
+  namespace: documentdb-preview-ns
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pg-exporter
+  podMetricsEndpoints:
+    - port: metrics
+      interval: 5s
+      scrapeTimeout: 4s
+      relabelings:
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_label_pg_exporter_target]
+          targetLabel: pg_target
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node

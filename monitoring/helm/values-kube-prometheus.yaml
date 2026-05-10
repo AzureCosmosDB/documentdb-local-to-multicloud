@@ -1,0 +1,128 @@
+# kube-prometheus-stack values for the Techorama DocumentDB demo
+# Goals:
+#  - Lightweight (single replica, modest CPU/RAM)
+#  - Grafana exposed on LoadBalancer with anonymous viewer access
+#  - Picks up PodMonitors / ServiceMonitors from any namespace
+#  - Pre-loads CNPG dashboards via sidecar
+#  - Alertmanager disabled (no alerts in the demo)
+
+defaultRules:
+  create: false
+
+alertmanager:
+  enabled: false
+
+kubeApiServer:
+  enabled: true
+kubelet:
+  enabled: true
+kubeControllerManager:
+  enabled: false
+coreDns:
+  enabled: true
+kubeEtcd:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeStateMetrics:
+  enabled: true
+nodeExporter:
+  enabled: true
+
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 100Mi
+  admissionWebhooks:
+    patch:
+      enabled: true
+  tls:
+    enabled: false
+
+prometheus:
+  prometheusSpec:
+    replicas: 1
+    retention: 6h
+    retentionSize: 4GB
+    resources:
+      requests:
+        cpu: 200m
+        memory: 800Mi
+      limits:
+        memory: 1500Mi
+    # Pick up PodMonitors / ServiceMonitors / Probes from ANY namespace,
+    # not just labels matching the helm release.
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    # Persist scrape data so a Grafana refresh isn't blank.
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 8Gi
+    # Allow scraping the istio-mTLS namespaces (we add a port-scoped
+    # PeerAuthentication in PERMISSIVE mode so :9187 accepts plaintext).
+    enableRemoteWriteReceiver: false
+
+grafana:
+  enabled: true
+  defaultDashboardsTimezone: browser
+  adminPassword: techorama2026
+  service:
+    type: LoadBalancer
+    port: 80
+  persistence:
+    enabled: true
+    size: 2Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 200Mi
+  grafana.ini:
+    auth.anonymous:
+      enabled: true
+      org_role: Viewer
+      hide_version: true
+    auth:
+      disable_login_form: false
+    users:
+      viewers_can_edit: false
+    server:
+      root_url: "%(protocol)s://%(domain)s/"
+      serve_from_sub_path: false
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+    dashboards:
+      default_home_dashboard_path: /tmp/dashboards/documentdb-failover.json
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+      provider:
+        allowUiUpdates: true
+        foldersFromFilesStructure: true
+    datasources:
+      enabled: true
+      defaultDatasourceEnabled: true
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: "documentdb"
+          orgId: 1
+          folder: "DocumentDB"
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /tmp/dashboards

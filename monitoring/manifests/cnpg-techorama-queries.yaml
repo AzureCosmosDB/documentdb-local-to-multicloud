@@ -1,0 +1,146 @@
+# Custom CNPG monitoring queries for the Techorama failover demo.
+#
+# Why custom?
+#   The default CNPG queries try to reach into pg_catalog views that JOIN
+#   against per-database objects, including the documentdb_core schema
+#   that the postgres metrics user has no rights on. They fail with
+#   "permission denied for schema documentdb_core (SQLSTATE 42501)" and
+#   the whole metrics commit rolls back, leaving us with only the
+#   trivial cnpg_collector_* set.
+#
+# These queries are narrower and stay inside system catalogs that the
+# streaming_replica role can read.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cnpg-techorama-monitoring
+  namespace: documentdb-preview-ns
+data:
+  queries: |
+    # Per-database transaction + IO stats.
+    # Avoids per-table joins so we don't trip on documentdb_core ACLs.
+    pg_stat_database:
+      query: |
+        SELECT datname
+             , numbackends                   AS num_backends
+             , xact_commit                   AS xact_commit_total
+             , xact_rollback                 AS xact_rollback_total
+             , blks_read                     AS blocks_read_total
+             , blks_hit                      AS blocks_hit_total
+             , tup_returned                  AS rows_returned_total
+             , tup_fetched                   AS rows_fetched_total
+             , tup_inserted                  AS rows_inserted_total
+             , tup_updated                   AS rows_updated_total
+             , tup_deleted                   AS rows_deleted_total
+             , conflicts                     AS conflicts_total
+             , temp_files                    AS temp_files_total
+             , temp_bytes                    AS temp_bytes_total
+             , deadlocks                     AS deadlocks_total
+        FROM pg_catalog.pg_stat_database
+        WHERE datname IS NOT NULL
+      metrics:
+        - datname:                  { usage: LABEL,    description: "Database name" }
+        - num_backends:             { usage: GAUGE,    description: "Active backends connected to the database" }
+        - xact_commit_total:        { usage: COUNTER,  description: "Committed transactions" }
+        - xact_rollback_total:      { usage: COUNTER,  description: "Rolled-back transactions" }
+        - blocks_read_total:        { usage: COUNTER,  description: "Disk blocks read" }
+        - blocks_hit_total:         { usage: COUNTER,  description: "Buffer cache hits" }
+        - rows_returned_total:      { usage: COUNTER,  description: "Rows returned by sequential scans + index scans" }
+        - rows_fetched_total:       { usage: COUNTER,  description: "Rows fetched (index scans)" }
+        - rows_inserted_total:      { usage: COUNTER,  description: "Rows inserted" }
+        - rows_updated_total:       { usage: COUNTER,  description: "Rows updated" }
+        - rows_deleted_total:       { usage: COUNTER,  description: "Rows deleted" }
+        - conflicts_total:          { usage: COUNTER,  description: "Recovery conflicts" }
+        - temp_files_total:         { usage: COUNTER,  description: "Temp files created" }
+        - temp_bytes_total:         { usage: COUNTER,  description: "Temp bytes written" }
+        - deadlocks_total:          { usage: COUNTER,  description: "Deadlocks detected" }
+
+    # Database-level disk consumption.
+    pg_database_size:
+      query: |
+        SELECT datname
+             , pg_database_size(datname) AS size_bytes
+        FROM pg_catalog.pg_database
+        WHERE datistemplate = false
+      metrics:
+        - datname:    { usage: LABEL, description: "Database name" }
+        - size_bytes: { usage: GAUGE, description: "On-disk size" }
+
+    # Streaming replication state — primary-side view of each connected replica.
+    # Only meaningful on the primary (replicas return zero rows).
+    pg_stat_replication:
+      primary: true
+      query: |
+        SELECT application_name
+             , state
+             , sync_state
+             , COALESCE(EXTRACT(EPOCH FROM write_lag),  0) AS write_lag_seconds
+             , COALESCE(EXTRACT(EPOCH FROM flush_lag),  0) AS flush_lag_seconds
+             , COALESCE(EXTRACT(EPOCH FROM replay_lag), 0) AS replay_lag_seconds
+             , COALESCE(pg_wal_lsn_diff(sent_lsn,   replay_lsn), 0) AS replay_bytes_behind
+             , COALESCE(pg_wal_lsn_diff(sent_lsn,   flush_lsn),  0) AS flush_bytes_behind
+             , COALESCE(pg_wal_lsn_diff(sent_lsn,   write_lsn),  0) AS write_bytes_behind
+        FROM pg_catalog.pg_stat_replication
+      metrics:
+        - application_name:     { usage: LABEL,   description: "Replica application_name" }
+        - state:                { usage: LABEL,   description: "Replication state" }
+        - sync_state:           { usage: LABEL,   description: "Sync state (sync/async/quorum)" }
+        - write_lag_seconds:    { usage: GAUGE,   description: "Time between local write and remote write" }
+        - flush_lag_seconds:    { usage: GAUGE,   description: "Time between local write and remote flush" }
+        - replay_lag_seconds:   { usage: GAUGE,   description: "Time between local write and remote replay" }
+        - replay_bytes_behind:  { usage: GAUGE,   description: "Bytes the replica has not yet replayed" }
+        - flush_bytes_behind:   { usage: GAUGE,   description: "Bytes the replica has not yet flushed" }
+        - write_bytes_behind:   { usage: GAUGE,   description: "Bytes the replica has not yet written" }
+
+    # Replica-side view: walreceiver status, latest_end_lsn, etc.
+    # Only meaningful on standbys.
+    pg_stat_wal_receiver:
+      runonserver: ">=10.0.0"
+      query: |
+        SELECT status
+             , COALESCE(pg_wal_lsn_diff(latest_end_lsn, '0/0'), 0)            AS latest_end_lsn_bytes
+             , COALESCE(EXTRACT(EPOCH FROM (now() - latest_end_time)), 0)     AS seconds_since_last_msg
+        FROM pg_catalog.pg_stat_wal_receiver
+      metrics:
+        - status:                  { usage: LABEL, description: "Walreceiver status (streaming, starting, stopping, ...)" }
+        - latest_end_lsn_bytes:    { usage: GAUGE, description: "Last WAL position received from primary, expressed as bytes" }
+        - seconds_since_last_msg:  { usage: GAUGE, description: "Seconds since the last message was received from primary" }
+
+    # Activity by state (active, idle, idle in transaction, ...).
+    # Bounded to 7 known states so the cardinality is fixed.
+    pg_stat_activity:
+      query: |
+        WITH states(state) AS (
+          VALUES ('active'), ('idle'), ('idle in transaction'),
+                 ('idle in transaction (aborted)'), ('fastpath function call'),
+                 ('disabled')
+        )
+        SELECT s.state
+             , COALESCE(c.connections, 0) AS connections
+             , COALESCE(c.max_xact_seconds, 0) AS max_xact_seconds
+        FROM states s
+        LEFT JOIN (
+          SELECT state
+               , COUNT(*) AS connections
+               , COALESCE(EXTRACT(EPOCH FROM max(now() - xact_start)), 0) AS max_xact_seconds
+          FROM pg_catalog.pg_stat_activity
+          WHERE state IS NOT NULL
+          GROUP BY state
+        ) c USING (state)
+      metrics:
+        - state:             { usage: LABEL, description: "Backend state" }
+        - connections:       { usage: GAUGE, description: "Current backends in this state" }
+        - max_xact_seconds:  { usage: GAUGE, description: "Longest-running transaction in this state, in seconds" }
+
+    # WAL position on this node (works on primary AND replica).
+    pg_wal_position:
+      query: |
+        SELECT
+          CASE WHEN pg_is_in_recovery()
+               THEN pg_wal_lsn_diff(pg_last_wal_replay_lsn(), '0/0')
+               ELSE pg_wal_lsn_diff(pg_current_wal_lsn(),     '0/0')
+          END AS lsn_bytes
+        , CASE WHEN pg_is_in_recovery() THEN 1 ELSE 0 END AS in_recovery
+      metrics:
+        - lsn_bytes:    { usage: GAUGE, description: "Current WAL position (or last replay LSN on standby) as bytes from origin" }
+        - in_recovery:  { usage: GAUGE, description: "1 if this node is a standby, 0 if primary" }

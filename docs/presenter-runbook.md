@@ -734,3 +734,83 @@ kubectl --context hub -n documentdb-preview-ns patch dbs.documentdb.io documentd
 Failback (EKS -> AKS) is the same `kubectl documentdb promote` command with
 `--target-cluster azure-documentdb`, *if* the demoted AKS member has finished
 re-bootstrapping as a replica.
+
+
+## K) Observability tour with Grafana (3-4 min, optional but high-value)
+
+Both clusters run **kube-prometheus-stack** + a standalone **postgres-exporter**
+sidecar pair (one for the CNPG primary `-rw` service, one for the `-ro`
+replicas). A pre-loaded dashboard called **DocumentDB Failover Overview**
+is wired to fire automatically when you click the start.ps1-launched
+Grafana tabs.
+
+| Cluster | Grafana URL                                                                                       | Login                                            |
+|---------|---------------------------------------------------------------------------------------------------|--------------------------------------------------|
+| Azure   | http://40.70.169.198                                                                              | anonymous Viewer; `admin / techorama2026` to edit |
+| AWS     | http://a6d5c0d8966584a85a1e540671a3132b-947608160.us-west-2.elb.amazonaws.com                     | same                                              |
+
+**Demo beats:**
+
+1. Open both Grafana tabs side-by-side. Point out the 9 panels:
+   - **Cluster role** (stat) — green PRIMARY on one, blue REPLICA on the other.
+   - **WAL position** — same LSN on both when healthy, diverges during failover.
+   - **DB size**, **active backends**, **TPS**, **tuple ops** — workload signal.
+   - **Replication lag bytes / seconds**, **WAL receiver up/down** — failover signal.
+   - **Connections by state** — pool pressure during the load test.
+2. Walk to the Load tab on the monitor app, pick **Morning** preset (50 RPS),
+   and within ~10s the **TPS** and **tuple ops** panels light up on the
+   current primary's cloud.
+3. Trigger a failover from the monitor's Topology tab. Within 30-60s:
+   - The **Cluster role** panel on the new primary flips PRIMARY (green).
+   - **Replication lag seconds** spikes briefly on the new replica then settles.
+   - **WAL receiver up** drops to 0 on the old primary, comes back up as
+     replica.
+
+> **Operator gotcha (May 2026 preview):** CNPG's built-in metrics exporter
+> hits a `permission denied for schema documentdb_core` error on every
+> query because the documentdb extension's auth hook fires on the BIND
+> phase of `pgx`'s named prepared statements. We deploy
+> `prometheuscommunity/postgres-exporter` (lib/pq, no prepared statements)
+> instead. The `cnpg_monitor` role + grants are already replicated via
+> WAL — you do **not** need to recreate them after a failover.
+
+## L) Load tester (Load tab in the monitor app)
+
+The Load tab simulates a realistic bookings site mix against the **current
+primary** so the Grafana panels (and the monitor's own Bookings tab) have
+something to show during a failover demo.
+
+| Operation | Mix  | Target collection            | What it does                           |
+|-----------|------|------------------------------|----------------------------------------|
+| browse    | 80%  | `bookingsdb.listings`        | `find {city, price<=X}` sort+limit 20  |
+| detail    | 15%  | `bookingsdb.listings`        | `findOne by _id` from sample cache     |
+| insert    | 4%   | `bookingsdb.loadgen_bookings`| insert one fake booking                |
+| update    | 1%   | `bookingsdb.loadgen_bookings`| confirm a recent loadgen booking       |
+
+The writer collection (`loadgen_bookings`) is **separate** from the demo
+Bookings tab's `bookings` collection so the on-screen Bookings list stays
+clean and readable; the load tester never pollutes it.
+
+**Presets** (RPS slider 0-500):
+- **Idle** (5 RPS) — quiet baseline, just enough to keep panels alive.
+- **Morning** (50 RPS) — cruising load, recommended for the failover demo.
+- **Peak** (150 RPS) — visible commit/TPS activity on Grafana.
+- **Black Friday** (400 RPS) — stress mode; only run if pool sizes are
+  generous on the primary (see `maxPoolSize` in `server.js`).
+
+**Demo beats:**
+
+1. Drop the writer collection first via **Drop loadgen_bookings** so the
+   `total_ops` counter starts clean.
+2. Pick a preset (or set a custom RPS), click **Start**.
+3. Watch **observed_rps** climb to match the slider value within ~5s, and
+   **p50/p95/p99 latency** stay below ~50ms on a healthy cluster.
+4. During a failover, p95/p99 spike briefly (3-10s) and the per-op error
+   counts tick up; once the new primary is writeable, latencies recover.
+
+> **Tuning notes:**
+> - Pool size: `maxPoolSize: 32, minPoolSize: 2` in `server.js`. Bump to
+>   64+ if you sustain >200 RPS with high latency.
+> - The listings sample cache TTL is 5 minutes (500 docs). If you reseed
+>   `listings` mid-demo, restart the monitor app to pick up fresh `_id`s.
+
