@@ -98,28 +98,35 @@ Show `docker-compose.yml`, then:
 
 ```bash
 docker compose up -d
-docker ps
+docker compose ps
 ```
 
 Talking points:
 - Same image used in CI (next demo) and Kubernetes (later demos)
-- Port `27017` mapped to the gateway''s `10260`
+- Port `27017` mapped to the gateway's `10260`
 - TLS on by default - `tlsAllowInvalidCertificates=true` for the demo cert
+- The `seed-listings` sidecar runs once on first up: loads
+  `data/listings_vectors.json` into `bookingsdb.listings`, then creates
+  the cosmosSearch vector index + four query indexes, then exits.
+  Idempotent on re-runs (skips if the collection already has documents).
 
-Then load the booking dataset (idempotent - skip if already loaded):
+Expect ~60-90s from `up -d` to a populated database. Verify before moving on:
 
 ```powershell
-$env:MONGODB_URI = "mongodb://demo:demo@localhost:27017/?tls=true&tlsAllowInvalidCertificates=true"
-node scripts\load_listings.mjs
+mongosh "mongodb://demo:demo@localhost:27017/?tls=true&tlsAllowInvalidCertificates=true" `
+  --quiet --eval "use('bookingsdb'); db.listings.countDocuments()"
+# -> 1000
 ```
 
-> Why Node, not the bash script? The Windows demo box doesn't have `mongosh`
-> in WSL, and Windows env vars don't propagate into WSL bash without
-> `WSLENV` plumbing. The Node loader is cross-platform and uses the same
-> driver the apps use. (`scripts/load-data.sh` still exists for Linux/CI.)
+Result: `bookingsdb.listings` with 1,000 documents, `vectorSearchIndex`
+(HNSW, cosine, 1536-dim), and four secondary indexes (`property_type+price`,
+`price`, `bedrooms+beds`, `tags`).
 
-Result: `bookingsdb.listings` with 1,000 documents, vector index, and four
-query indexes. First-time setup will run `npm install` once in `scripts/`.
+> **Reload trick** (only if you need to re-seed without restarting the
+> container — e.g. someone deleted a document mid-demo):
+> `node scripts\load_listings.mjs`. Same dataset, same indexes, runs
+> against an already-up container. (`scripts/load-data.sh` is the
+> Linux/CI equivalent.)
 
 ### B) VS Code connection (2-4 min)
 
