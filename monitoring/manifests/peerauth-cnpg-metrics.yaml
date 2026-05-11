@@ -1,6 +1,11 @@
 # PeerAuthentication: allow Prometheus (no istio sidecar) to scrape
 # CNPG metrics on :9187 in plaintext, while keeping mTLS for app traffic.
 #
+# Port 8000 is the CNPG instance status endpoint that the operator polls.
+# The CNPG operator pod doesn't have an Istio sidecar, so without this its
+# HTTPS calls to :8000 are rejected by Istio mTLS and the cluster shows
+# "Instance Status Extraction Error: HTTP communication issue".
+#
 # Apply with --context aws-documentdb AND --context azure-documentdb.
 apiVersion: security.istio.io/v1
 kind: PeerAuthentication
@@ -15,4 +20,6 @@ spec:
     mode: STRICT
   portLevelMtls:
     "9187":
+      mode: PERMISSIVE
+    "8000":
       mode: PERMISSIVE
