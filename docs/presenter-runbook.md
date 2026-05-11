@@ -201,25 +201,36 @@ Run. Show the results pane.
 
 To populate the **Query Insights** tab with a query worth talking about, paste
 this filter into the Query Editor (no projection or sort - just the filter).
-It forces a COLLSCAN because there's no text index on `search_text`, so it
-examines all 1,000 docs:
+It forces a COLLSCAN because the existing `bedrooms_1_beds_1` compound index
+can't serve a standalone `beds` predicate (compound-prefix rule — `bedrooms`
+has to be in the filter first), so the planner reads all 1,000 docs:
 
 ```json
-{ "search_text": { "$regex": "rooftop", "$options": "i" } }
+{ "beds": 4 }
 ```
 
-> Returns ~34 hits, examines 1,000 docs, ~30-60 ms. Run it 2-3 times so it
+> Returns 57 hits, examines 1,000 docs, ~20-40 ms. Run it 2-3 times so it
 > shows up clearly in Query Insights with a frequency count.
 
 Now open **Query Insights** on the connection. Talking points:
 
-- The slow regex is at the top of the list - high `docsExamined`, low
+- The slow `beds` query is at the top of the list - high `docsExamined`, low
   `docsReturned`, no index used
 - Compare against the indexed `property_type + price` query above - that one
   hits the compound index (`IXSCAN`) and barely registers
 - Real-world: this is how teams find the queries that secretly cost them
   money. The AI Index Advisor (section F) takes this further by recommending
   the index to fix it.
+
+> **Sidebar — why we don't demo a regex here.** It's tempting to use
+> `{ search_text: { $regex: "rooftop", $options: "i" } }` for the slow case,
+> but it's a trap: the advisor will suggest a single-field B-tree index on
+> `search_text`, the planner will pick it, and the query gets **slower**
+> (the regex still has to be tested against every index entry, plus a doc
+> fetch per candidate). Unanchored case-insensitive substring search needs a
+> `$text` index or vector search, not a B-tree. Save substring queries for
+> the vector demo in section G.
+
 
 ### E) Mongoshell (3 min)
 
