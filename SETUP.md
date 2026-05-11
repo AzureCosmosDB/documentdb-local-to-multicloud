@@ -66,9 +66,9 @@ python -m venv .venv
 
 pip install -r requirements.txt
 
-# 5. (Data is auto-loaded by docker compose — 20K restaurants + vectors)
+# 5. (Data is auto-loaded by docker compose — ~1K listings with 1536-dim vectors)
 # Verify:
-mongosh "mongodb://demo:demo@localhost:27017/?tls=true&tlsAllowInvalidCertificates=true" --eval "use('foodservice'); db.restaurants.countDocuments()"
+mongosh "mongodb://demo:demo@localhost:27017/?tls=true&tlsAllowInvalidCertificates=true" --eval "use('bookingsdb'); db.listings.countDocuments()"
 
 # 6. (Optional) Wipe indexes for Index Advisor demo
 bash data/wipe-data.sh --indexes

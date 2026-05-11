@@ -10,38 +10,28 @@ services:
       - "27017:10260"
     restart: unless-stopped
 
-  seed-restaurants:
+  seed-listings:
+    # Loads the bookings/listings demo dataset (matches data/load-data.sh).
+    # Targets: bookingsdb.listings from data/listings_vectors.json (~30 MB,
+    # includes the 1536-dim descriptionVector field used by the vector demo).
+    # Also creates the cosmosSearch vector index + supporting query indexes
+    # so the local demo matches the multi-cloud setup out of the box.
     build:
       context: ./docker/seed
     depends_on:
       - documentdb
     environment:
-      # Use the container-to-container endpoint/port (not the host-mapped port)
+      # Container-to-container endpoint (not the host-mapped 27017)
       MONGODB_URI: mongodb://demo:demo@documentdb:10260/?tls=true&tlsAllowInvalidCertificates=true
-      MONGODB_DB: foodservice
-      MONGODB_COLLECTION: restaurants
-      DATA_FILE: /data/restaurants.json
-      SEED_ONLY_IF_EMPTY: "true"
-      DROP_COLLECTION: "false"
-      BATCH_SIZE: "1000"
-    volumes:
-      - ./data:/data:ro
-    restart: "no"
-
-  seed-restaurants-vectors:
-    build:
-      context: ./docker/seed
-    depends_on:
-      - documentdb
-    environment:
-      # Use the container-to-container endpoint/port (not the host-mapped port)
-      MONGODB_URI: mongodb://demo:demo@documentdb:10260/?tls=true&tlsAllowInvalidCertificates=true
-      MONGODB_DB: foodservice
-      MONGODB_COLLECTION: restaurants_vectors
-      DATA_FILE: /data/restaurants_vectors.json
+      MONGODB_DB: bookingsdb
+      MONGODB_COLLECTION: listings
+      DATA_FILE: /data/listings_vectors.json
       SEED_ONLY_IF_EMPTY: "true"
       DROP_COLLECTION: "false"
       BATCH_SIZE: "500"
+      CREATE_INDEXES: "true"
+      VECTOR_FIELD: "descriptionVector"
+      VECTOR_DIMENSIONS: "1536"
     volumes:
       - ./data:/data:ro
     restart: "no"
