@@ -99,6 +99,7 @@ mongosh "$MONGODB_URI" --eval "
   db['$COLLECTION_NAME'].createIndex({ price: 1 });
   db['$COLLECTION_NAME'].createIndex({ bedrooms: 1, beds: 1 });
   db['$COLLECTION_NAME'].createIndex({ tags: 1 });
+  db['$COLLECTION_NAME'].createIndex({ id: 1 });
   print('Query indexes created');
   
   const count = db['$COLLECTION_NAME'].countDocuments();

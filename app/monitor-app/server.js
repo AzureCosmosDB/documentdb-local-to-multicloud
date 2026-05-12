@@ -661,6 +661,99 @@ app.post("/api/force-promote-local-token", async (req, res) => {
 // This is the recovery path for WAL-timeline divergence (the replica's
 // pg_stat_wal_receiver shows FATAL "requested starting point ... is not in
 // this server's history") that the preview operator does not auto-resolve.
+// Auto-recovery watcher for the post-rebuild cert mismatch bug in the
+// DocumentDB operator (see .scratch/findings/rebuild-cert-mismatch.md).
+//
+// Symptom: after a rebuild, the new CNPG Cluster regenerates -ca, -server,
+// and -replication secrets, but the CA stored in -ca occasionally does not
+// match the issuing CA of the cert in -server. The operator logs:
+//   `x509: certificate signed by unknown authority`
+// and the cluster phase sticks at:
+//   "Instance Status Extraction Error: HTTP communication issue"
+//
+// We poll the cluster phase for ~6 minutes. If it stays stuck in the
+// extraction-error state for >60s AND the operator log contains x509
+// errors, we delete the three cert secrets, restart the operator
+// deployment so it regenerates them atomically, and delete the postgres
+// pod so it picks up the fresh cert. Then we exit. Idempotent + safe.
+//
+// Only one watcher per context runs at a time.
+const _rebuildWatchers = new Map(); // ctx -> Promise
+
+function startRebuildWatcher(ctx, cnpgClusterName) {
+  if (_rebuildWatchers.has(ctx)) {
+    console.log(`[rebuild-watch:${ctx}] watcher already running; skipping`);
+    return;
+  }
+  const p = (async () => {
+    console.log(`[rebuild-watch:${ctx}] started for cluster=${cnpgClusterName}`);
+    const deadline = Date.now() + 6 * 60_000;
+    let stuckSince = 0;
+    let fixApplied = false;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 15_000));
+      // 1. read current cluster name + phase
+      let cl;
+      try { cl = await findCNPGCluster(ctx); } catch (_) { cl = null; }
+      const name = cl?.metadata?.name || cnpgClusterName;
+      const phase = cl?.status?.phase || "(unknown)";
+      console.log(`[rebuild-watch:${ctx}] cluster=${name} phase="${phase}"`);
+      if (/^Cluster in healthy state/i.test(phase)) {
+        console.log(`[rebuild-watch:${ctx}] cluster healthy; exiting watcher`);
+        break;
+      }
+      const isStuckCert = /Instance Status Extraction Error|HTTP communication issue/i.test(phase);
+      if (!isStuckCert) { stuckSince = 0; continue; }
+      if (stuckSince === 0) stuckSince = Date.now();
+      const stuckMs = Date.now() - stuckSince;
+      if (stuckMs < 60_000 || fixApplied) continue;
+      // 2. confirm via operator log that it's the x509 bug
+      const log = await kubectl(
+        ["--context", ctx, "-n", "cnpg-system", "logs",
+         "deploy/documentdb-operator-cloudnative-pg", "--tail=30", "--since=2m"],
+        { timeoutMs: 8000 }
+      );
+      const sawX509 = /x509|unknown authority|verification failure/i.test((log.stdout || "") + (log.stderr || ""));
+      if (!sawX509) {
+        console.log(`[rebuild-watch:${ctx}] stuck but no x509 errors in operator log; leaving for manual review`);
+        continue;
+      }
+      console.log(`[rebuild-watch:${ctx}] detected cert mismatch (x509). Applying auto-fix on cluster=${name}`);
+      fixApplied = true;
+      // 3. delete cert secrets
+      await kubectl(
+        ["--context", ctx, "-n", NAMESPACE, "delete", "secret",
+         `${name}-ca`, `${name}-server`, `${name}-replication`, "--ignore-not-found"],
+        { timeoutMs: 15000 }
+      );
+      // 4. restart operator
+      await kubectl(
+        ["--context", ctx, "-n", "cnpg-system", "rollout", "restart",
+         "deploy/documentdb-operator-cloudnative-pg"],
+        { timeoutMs: 15000 }
+      );
+      await kubectl(
+        ["--context", ctx, "-n", "cnpg-system", "rollout", "status",
+         "deploy/documentdb-operator-cloudnative-pg", "--timeout=90s"],
+        { timeoutMs: 100000 }
+      );
+      // 5. delete pod so it picks up fresh cert
+      await kubectl(
+        ["--context", ctx, "-n", NAMESPACE, "delete", "pod", `${name}-1`, "--wait=false"],
+        { timeoutMs: 15000 }
+      );
+      console.log(`[rebuild-watch:${ctx}] auto-fix applied; will keep polling for healthy state`);
+      stuckSince = 0;
+    }
+    console.log(`[rebuild-watch:${ctx}] watcher exiting`);
+  })().catch((err) => {
+    console.error(`[rebuild-watch:${ctx}] error: ${err.message || err}`);
+  }).finally(() => {
+    _rebuildWatchers.delete(ctx);
+  });
+  _rebuildWatchers.set(ctx, p);
+}
+
 app.post("/api/rebuild-replica", async (req, res) => {
   const ctx = String(req.body?.context || "");
   if (!MEMBER_CONTEXTS.includes(ctx)) {
@@ -688,11 +781,24 @@ app.post("/api/rebuild-replica", async (req, res) => {
     if (del.code !== 0) {
       return res.status(500).json({ ok: false, error: del.stderr || del.stdout || "delete failed" });
     }
+    // Also wipe the PVCs. Without this, the operator reuses the existing
+    // disks and the new "replica" boots with stale WAL on the OLD timeline,
+    // which then can't catch up to the new primary's forked timeline
+    // (FATAL: requested starting point ... is not in this server's history).
+    // Deleting PVCs forces a true pg_basebackup from the current primary.
+    kubectl([
+      "--context", ctx, "-n", NAMESPACE,
+      "delete", "pvc", "-l", `cnpg.io/cluster=${c.metadata.name}`,
+      "--wait=false", "--ignore-not-found",
+    ]).catch((err) => console.error(`[rebuild:${ctx}] PVC delete failed: ${err.message || err}`));
     res.json({
       ok: true,
       cluster: c.metadata.name,
-      message: `Deleted CNPG cluster ${c.metadata.name} in ${ctx}. The DocumentDB operator will re-bootstrap it from primary via pg_basebackup. Watch /api/status for progress.`,
+      message: `Deleted CNPG cluster ${c.metadata.name} (and PVCs) in ${ctx}. The DocumentDB operator will re-bootstrap it from primary via pg_basebackup. Auto-healing watcher engaged for known cert-mismatch issue. Watch /api/status for progress.`,
     });
+    // Fire-and-forget background watcher that auto-recovers from the
+    // post-rebuild cert-mismatch bug (see findings doc).
+    startRebuildWatcher(ctx, c.metadata.name);
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err.message || err) });
   }
@@ -793,6 +899,56 @@ async function getMongoDb(ctx) {
     console.log(`[mongo:${ctx}] connected via 127.0.0.1:${port} → ${GATEWAY_SVC}:${GATEWAY_PORT}`);
     return st.db;
   })().catch((err) => { mongoState.delete(ctx); throw err; });
+  return st.ready;
+}
+
+// ---------- Loadgen-isolated Mongo pool ----------
+// The load tester uses a SEPARATE MongoClient + port-forward so that bursts of
+// loadgen traffic can't starve the shared pool used by the topology tab's
+// write probe, replication monitor, bookings tab, etc.
+const loadgenMongoState = new Map(); // ctx -> { client, db, port, pf, password, ready }
+
+async function getLoadgenMongoDb(ctx) {
+  if (!MEMBER_CONTEXTS.includes(ctx)) throw new Error(`unknown context ${ctx}`);
+  let st = loadgenMongoState.get(ctx);
+  if (st) return st.ready;
+  const port = nextLocalPort++;
+  st = { port };
+  loadgenMongoState.set(ctx, st);
+  st.ready = (async () => {
+    st.password = await getGatewayPassword(ctx);
+    const args = [
+      "--context", ctx, "-n", NAMESPACE,
+      "port-forward", `svc/${GATEWAY_SVC}`, `${port}:${GATEWAY_PORT}`,
+    ];
+    console.log(`[pf:loadgen:${ctx}] kubectl ${args.join(" ")}`);
+    st.pf = spawn(KUBECTL, args, { stdio: ["ignore", "pipe", "pipe"] });
+    st.pf.stdout.on("data", (d) => process.stderr.write(`[pf:loadgen:${ctx}] ${d}`));
+    st.pf.stderr.on("data", (d) => process.stderr.write(`[pf:loadgen:${ctx}] ${d}`));
+    st.pf.on("exit", (code, sig) => {
+      console.error(`[pf:loadgen:${ctx}] exited code=${code} sig=${sig} — invalidating client`);
+      const cur = loadgenMongoState.get(ctx);
+      if (cur?.client) { cur.client.close().catch(() => {}); }
+      loadgenMongoState.delete(ctx);
+    });
+    const up = await waitForPort("127.0.0.1", port, 12_000);
+    if (!up) {
+      try { st.pf.kill(); } catch (_) {}
+      loadgenMongoState.delete(ctx);
+      throw new Error(`loadgen port-forward to ${ctx}/${GATEWAY_SVC} never became ready`);
+    }
+    const uri = `mongodb://${encodeURIComponent(GATEWAY_USER)}:${encodeURIComponent(st.password)}@127.0.0.1:${port}/?tls=true&tlsAllowInvalidCertificates=true&directConnection=true`;
+    st.client = new MongoClient(uri, {
+      serverSelectionTimeoutMS: 8_000,
+      connectTimeoutMS: 8_000,
+      maxPoolSize: 12,
+      minPoolSize: 1,
+    });
+    await st.client.connect();
+    st.db = st.client.db(DEMO_DB);
+    console.log(`[mongo:loadgen:${ctx}] connected via 127.0.0.1:${port} → ${GATEWAY_SVC}:${GATEWAY_PORT} (pool=12)`);
+    return st.db;
+  })().catch((err) => { loadgenMongoState.delete(ctx); throw err; });
   return st.ready;
 }
 
@@ -1070,7 +1226,7 @@ const loadgen = new LoadGen({
   getDbForPrimary: async () => {
     const ctx = await getGlobalPrimaryContext();
     if (!ctx) return null;
-    return getMongoDb(ctx);
+    return getLoadgenMongoDb(ctx);
   },
   log: (msg) => console.log(msg),
 });

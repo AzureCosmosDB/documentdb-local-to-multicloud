@@ -21,6 +21,7 @@ const { ObjectId } = require("mongodb");
 
 const DEFAULT_MIX = { browse: 80, detail: 15, insert: 4, update: 1 };
 const MAX_RPS = 500;
+const MAX_IN_FLIGHT = 20;
 const STATS_WINDOW_SEC = 60;
 const RECENT_INSERT_RING_SIZE = 200;
 const LISTINGS_SAMPLE_SIZE = 500;
@@ -76,6 +77,8 @@ class LoadGen {
     };
     this.recentOpsTimes = [];   // unix ms timestamps for RPS calc
     this.recentLatencies = [];  // {op, ms, ts}
+    this.inFlight = 0;
+    this.dropped = 0;
   }
 
   status() {
@@ -102,6 +105,9 @@ class LoadGen {
       latency_p99_ms: Math.round(quantile(allLat, 0.99)),
       total_ops: this.recentOpsTimes.length, // since process start (capped)
       by_op: totals,
+      in_flight: this.inFlight,
+      max_in_flight: MAX_IN_FLIGHT,
+      dropped: this.dropped,
       recent_inserted: this.recentInsertIds.length,
       listings_sampled: this.listingsSample.length,
     };
@@ -126,6 +132,8 @@ class LoadGen {
     // Reset rolling stats
     this.recentOpsTimes = [];
     this.recentLatencies = [];
+    this.inFlight = 0;
+    this.dropped = 0;
     this.opStats = {
       browse: emptyOpStats(),
       detail: emptyOpStats(),
@@ -143,7 +151,12 @@ class LoadGen {
       const fire = Math.floor(opsCarry);
       opsCarry -= fire;
       for (let i = 0; i < fire; i++) {
-        this._dispatchOne().catch(() => {});
+        if (this.inFlight >= MAX_IN_FLIGHT) {
+          this.dropped++;
+          continue;
+        }
+        this.inFlight++;
+        this._dispatchOne().catch(() => {}).finally(() => { this.inFlight--; });
       }
       // Trim recent windows
       const now = Date.now();

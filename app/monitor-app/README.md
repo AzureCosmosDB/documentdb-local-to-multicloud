@@ -13,11 +13,34 @@ Live monitoring + one-click failover dashboard for multi-cloud DocumentDB.
 
 ## Run
 
+The easiest way is the repo-root launcher, which sets env vars, opens the UI,
+opens both Grafana tabs, and starts the server in one shot:
+
 ```powershell
-$env:PATH = "$env:USERPROFILE\bin;$env:USERPROFILE\.azure-kubelogin;$env:PATH"
-cd C:\Users\mjbrown\GitHub\EMU\CosmosDB-PM-Agents\.local\workstreams\events\techorama-belgium-2026\multi-cloud-demo\monitor-app
+# From the repo root (documentdb-local-to-multicloud)
+.\start.ps1
+```
+
+First-time setup (once per clone):
+
+```powershell
+cd app\monitor-app
 npm install
-npm start
+```
+
+Flags on `start.ps1`:
+
+- `-NoGrafana` — skip the two Grafana tabs
+- `-NoBrowser` — start the server without opening any tabs
+
+If you'd rather run the monitor by hand (no auto-opened tabs, no Grafana):
+
+```powershell
+cd app\monitor-app
+$env:PORT = "5174"
+$env:DDB_HUB_CONTEXT = "hub"
+$env:DDB_MEMBER_CONTEXTS = "azure-documentdb,aws-documentdb"
+node server.js
 # open http://localhost:5174
 ```
 

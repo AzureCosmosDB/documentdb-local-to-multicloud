@@ -26,3 +26,6 @@ infra/multi-cloud/*.tgz
 
 
 .scratch/
+
+# Local presenter copy with secrets - never commit
+docs/demo.md

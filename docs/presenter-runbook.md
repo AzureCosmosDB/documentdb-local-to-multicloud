@@ -92,7 +92,7 @@ These bit me on the dry-run and deploy.sh now auto-handles most of them, but kee
 
 ## Live demo script
 
-### A) Local start (2-3 min)
+### Local start (2-3 min)
 
 Show `docker-compose.yml`, then:
 
@@ -128,7 +128,7 @@ Result: `bookingsdb.listings` with 1,000 documents, `vectorSearchIndex`
 > against an already-up container. (`scripts/load-data.sh` is the
 > Linux/CI equivalent.)
 
-### B) VS Code connection (2-4 min)
+### VS Code connection (2-4 min)
 
 In the **DocumentDB** panel:
 
@@ -156,7 +156,30 @@ In the **DocumentDB** panel:
 
 Highlight: same UX you''ll use against the cloud clusters in section I.
 
-### C) Data import + exploration (3 min)
+### Mongoshell Integration (3 min)
+
+Right-click the connection -> **Launch Shell**, or open a fresh terminal and run:
+
+```powershell
+mongosh "mongodb://demo:demo@localhost:27017/bookingsdb?tls=true&tlsAllowInvalidCertificates=true&directConnection=true"
+```
+
+Then:
+
+```javascript
+use bookingsdb
+```
+
+Find entire homes under $200:
+
+```javascript
+db.listings.find(
+  { property_type: "Entire home", price: { $lt: 200 } },
+  { displayName: 1, city: 1, price: 1, bedrooms: 1 }
+).limit(5)
+```
+
+### Data exploration
 
 In the extension, open `bookingsdb.listings` and click into a single document
 to show **JSON view**:
@@ -175,7 +198,7 @@ use the same model. We'll search against it in section G.
 > doesn't expand arrays usefully, and the table doesn't sort. The query
 > editor in section D is where filtering and sorting actually shine.
 
-### D) Query editor (4 min)
+### Query editor
 
 Right-click `listings` -> **Find** (or open the Documents view). Click the gear
 and paste:
@@ -195,9 +218,9 @@ and paste:
 { "price": 1 }
 ```
 
-Run. Show the results pane.
+Run. Show the results pane. Note the Query Efficiency Analysis on the right.
 
-#### Generate a slow query for Query Insights
+### Query Insights and Index Advisor
 
 To populate the **Query Insights** tab with a query worth talking about, paste
 this filter into the Query Editor (no projection or sort - just the filter).
@@ -232,97 +255,7 @@ Now open **Query Insights** on the connection. Talking points:
 > the vector demo in section G.
 
 
-### E) Mongoshell (3 min)
-
-Right-click the connection -> **Launch Shell**, or open a fresh terminal and run:
-
-```powershell
-mongosh "mongodb://demo:demo@localhost:27017/bookingsdb?tls=true&tlsAllowInvalidCertificates=true&directConnection=true"
-```
-
-Then:
-
-```javascript
-use bookingsdb
-```
-
-Find entire homes under $200:
-
-```javascript
-db.listings.find(
-  { property_type: "Entire home", price: { $lt: 200 } },
-  { displayName: 1, city: 1, price: 1, bedrooms: 1 }
-).limit(5)
-```
-
-Tag-based filter (multikey index on `tags`):
-
-```javascript
-db.listings.find(
-  { tags: { $all: ["downtown", "wifi"] } },
-  { displayName: 1, tags: 1, price: 1 }
-).limit(5)
-```
-
-Aggregation - average price per property type:
-
-```javascript
-db.listings.aggregate([
-  { $group: { _id: "$property_type", avgPrice: { $avg: "$price" }, n: { $sum: 1 } } },
-  { $sort: { avgPrice: -1 } }
-])
-```
-
-Aggregation - listings per city:
-
-```javascript
-db.listings.aggregate([
-  { $group: { _id: "$city", n: { $sum: 1 }, avgPrice: { $avg: "$price" } } },
-  { $sort: { n: -1 } },
-  { $limit: 10 }
-])
-```
-
-### F) Indexing + AI Index Advisor (4-6 min)
-
-Show that the loader already created useful indexes. In **mongosh**:
-
-```javascript
-db.listings.getIndexes()
-```
-
-> Expect: `_id_`, `vectorSearchIndex`, `property_type_1_price_1`, `price_1`, `bedrooms_1_beds_1`, `tags_1`
-
-Demo before/after on a query the indexes do **not** cover. Run the filter from
-the **Query Editor** in the DocumentDB extension so the run shows up in Query
-Insights and the Index Advisor:
-
-```json
-{ "bathrooms": 3 }
-```
-
-> Returns 28 hits, examines all 1,000 docs (full COLLSCAN). 36x amplification -
-> the optimizer is reading 36 documents for every row it returns. Run it 2-3
-> times.
-
-Open **Query Insights** - the run shows COLLSCAN with `docsExamined: 1000`
-vs `docsReturned: 28`.
-
-**AI Index Advisor:** Click the **Index Advisor** tab (lightbulb icon) on the
-listings collection. The advisor sees the slow run from Query Insights and
-recommends `{ bathrooms: 1 }`. Click **Create index** - no mongosh, no DDL.
-
-Re-run the same filter from the Query Editor. Query Insights now shows IXSCAN
-with `docsExamined: 28` - 36x fewer reads, ~10x faster. Compare
-`executionTimeMillis` and `totalDocsExamined` before and after.
-
-> Caveat - say this on stage: "On 1,000 documents you won''t see dramatic
-> recommendations because the dataset is too small for the optimizer to
-> care. In a real workload - millions of documents and active query
-> telemetry - the advisor watches your slow queries and suggests indexes
-> with explain-plan justifications and projected gain."
-
-### G) Vector search (5-6 min)
+### Vector search
 
 Show the index that ships with the dataset:
 
@@ -331,41 +264,18 @@ db.listings.getIndexes().filter(i => i.name === "vectorSearchIndex")
 // HNSW, cosine similarity, 1536 dim, on `descriptionVector`
 ```
 
-Run a semantic search using OpenAI `text-embedding-3-small` (must match the
-model used to build the corpus):
-
-```bash
-# In a Python REPL or scratch script
-python - <<''PY''
-import os
-from openai import OpenAI
-from pymongo import MongoClient
-
-oai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-emb = oai.embeddings.create(
-    model="text-embedding-3-small",
-    input="cozy downtown loft with hot tub and fast wifi for remote work"
-).data[0].embedding
-
-m = MongoClient("mongodb://demo:demo@localhost:27017/?tls=true&tlsAllowInvalidCertificates=true")
-results = m["bookingsdb"]["listings"].aggregate([
-    {"$search": {"cosmosSearch": {
-        "vector": emb, "path": "descriptionVector", "k": 5
-    }, "returnStoredSource": True}},
-    {"$project": {"_id": 0, "displayName": 1, "city": 1, "price": 1,
-                  "score": {"$meta": "searchScore"}}}
-])
-for r in results:
-    print(f"{r[''score'']:.4f}  ${r[''price'']}/night  {r[''city'']:<14}  {r[''displayName'']}")
-PY
-```
+- Open the DocumentDB demo portal
+- Run a couple of vector searches
+- Show the query pipeline
 
 Talking points:
 - Same query embedded with `text-embedding-3-small` (must match the corpus)
 - HNSW index on `descriptionVector`, cosine similarity
 - Results ranked by `searchScore`
 
-### H) CI/CD slide (3-5 min)
+### CI/CD slide
+
+Lets talk about multi-cloud
 
 Open `.github/workflows/ci.yml`:
 
@@ -373,7 +283,97 @@ Open `.github/workflows/ci.yml`:
 - Tests use `MONGODB_URI` - same env var as local + scripts
 - Push -> test against real DocumentDB -> no cloud cost
 
-### I) Kubernetes + multi-cloud (live, ~10 min)
+## Multi-Cloud
+
+
+- Go the the topology tab in the portal
+- Walk through the layout
+
+## Replication
+
+- To to the Bookings tab
+- Demonstrate data replicating from one cloud to the other
+
+## Observability
+
+Both clusters run **kube-prometheus-stack** + a standalone **postgres-exporter**
+sidecar pair (one for the CNPG primary `-rw` service, one for the `-ro`
+replicas). A pre-loaded dashboard called **DocumentDB Failover Overview**
+is wired to fire automatically when you click the start.ps1-launched
+Grafana tabs.
+
+| Cluster | Grafana URL                                                                                       | Login                                            |
+|---------|---------------------------------------------------------------------------------------------------|--------------------------------------------------|
+| Azure   | http://40.70.169.198                                                                              | anonymous Viewer; `admin / techorama2026` to edit |
+| AWS     | http://a6d5c0d8966584a85a1e540671a3132b-947608160.us-west-2.elb.amazonaws.com                     | same                                              |
+
+**Demo beats:**
+
+1. Open both Grafana tabs side-by-side. Point out the 9 panels:
+   - **Cluster role** (stat) — green PRIMARY on one, blue REPLICA on the other.
+   - **WAL position** — same LSN on both when healthy, diverges during failover.
+   - **DB size**, **active backends**, **TPS**, **tuple ops** — workload signal.
+   - **Replication lag bytes / seconds**, **WAL receiver up/down** — failover signal.
+   - **Connections by state** — pool pressure during the load test.
+2. Walk to the Load tab on the monitor app, pick **Morning** preset (50 RPS),
+   and within ~10s the **TPS** and **tuple ops** panels light up on the
+   current primary's cloud.
+3. Trigger a failover from the monitor's Topology tab. Within 30-60s:
+   - The **Cluster role** panel on the new primary flips PRIMARY (green).
+   - **Replication lag seconds** spikes briefly on the new replica then settles.
+   - **WAL receiver up** drops to 0 on the old primary, comes back up as
+     replica.
+
+> **Operator gotcha (May 2026 preview):** CNPG's built-in metrics exporter
+> hits a `permission denied for schema documentdb_core` error on every
+> query because the documentdb extension's auth hook fires on the BIND
+> phase of `pgx`'s named prepared statements. We deploy
+> `prometheuscommunity/postgres-exporter` (lib/pq, no prepared statements)
+> instead. The `cnpg_monitor` role + grants are already replicated via
+> WAL — you do **not** need to recreate them after a failover.
+
+## L) Load tester (Load tab in the monitor app)
+
+The Load tab simulates a realistic bookings site mix against the **current
+primary** so the Grafana panels (and the monitor's own Bookings tab) have
+something to show during a failover demo.
+
+| Operation | Mix  | Target collection            | What it does                           |
+|-----------|------|------------------------------|----------------------------------------|
+| browse    | 80%  | `bookingsdb.listings`        | `find {city, price<=X}` sort+limit 20  |
+| detail    | 15%  | `bookingsdb.listings`        | `findOne by _id` from sample cache     |
+| insert    | 4%   | `bookingsdb.loadgen_bookings`| insert one fake booking                |
+| update    | 1%   | `bookingsdb.loadgen_bookings`| confirm a recent loadgen booking       |
+
+The writer collection (`loadgen_bookings`) is **separate** from the demo
+Bookings tab's `bookings` collection so the on-screen Bookings list stays
+clean and readable; the load tester never pollutes it.
+
+**Presets** (RPS slider 0-500):
+- **Idle** (5 RPS) — quiet baseline, just enough to keep panels alive.
+- **Morning** (50 RPS) — cruising load, recommended for the failover demo.
+- **Peak** (150 RPS) — visible commit/TPS activity on Grafana.
+- **Black Friday** (400 RPS) — stress mode; only run if pool sizes are
+  generous on the primary (see `maxPoolSize` in `server.js`).
+
+**Demo beats:**
+
+1. Drop the writer collection first via **Drop loadgen_bookings** so the
+   `total_ops` counter starts clean.
+2. Pick a preset (or set a custom RPS), click **Start**.
+3. Watch **observed_rps** climb to match the slider value within ~5s, and
+   **p50/p95/p99 latency** stay below ~50ms on a healthy cluster.
+4. During a failover, p95/p99 spike briefly (3-10s) and the per-op error
+   counts tick up; once the new primary is writeable, latencies recover.
+
+> **Tuning notes:**
+> - Pool size: `maxPoolSize: 32, minPoolSize: 2` in `server.js`. Bump to
+>   64+ if you sustain >200 RPS with high latency.
+> - The listings sample cache TTL is 5 minutes (500 docs). If you reseed
+>   `listings` mid-demo, restart the monitor app to pick up fresh `_id`s.
+
+
+### Kubernetes + multi-cloud (live, ~10 min)
 
 Now the punchline: **one DocumentDB instance, two clouds, real replication, one
 command to fail over.**
@@ -520,11 +520,7 @@ Talking points:
 - If the VS Code extension misbehaves, mongoshell does the same job from a
   terminal split.
 
-## J) Cross-cloud failover demo (live monitor app)
-
-This is the "big red button" failover demo at the end of the
-multi-cloud segment. The app lives in `app/monitor-app/` - see its README
-for full setup. This section is the on-stage script.
+## Cross-cloud failover demo (live monitor app)
 
 > **DO ONE FAILOVER ON STAGE. Do not fail back live.**
 >
@@ -753,82 +749,12 @@ Failback (EKS -> AKS) is the same `kubectl documentdb promote` command with
 `--target-cluster azure-documentdb`, *if* the demoted AKS member has finished
 re-bootstrapping as a replica.
 
+## Post Demo
 
-## K) Observability tour with Grafana (3-4 min, optional but high-value)
+tear down local container to reset
 
-Both clusters run **kube-prometheus-stack** + a standalone **postgres-exporter**
-sidecar pair (one for the CNPG primary `-rw` service, one for the `-ro`
-replicas). A pre-loaded dashboard called **DocumentDB Failover Overview**
-is wired to fire automatically when you click the start.ps1-launched
-Grafana tabs.
+```shell
 
-| Cluster | Grafana URL                                                                                       | Login                                            |
-|---------|---------------------------------------------------------------------------------------------------|--------------------------------------------------|
-| Azure   | http://40.70.169.198                                                                              | anonymous Viewer; `admin / techorama2026` to edit |
-| AWS     | http://a6d5c0d8966584a85a1e540671a3132b-947608160.us-west-2.elb.amazonaws.com                     | same                                              |
+docker compose down -v
 
-**Demo beats:**
-
-1. Open both Grafana tabs side-by-side. Point out the 9 panels:
-   - **Cluster role** (stat) — green PRIMARY on one, blue REPLICA on the other.
-   - **WAL position** — same LSN on both when healthy, diverges during failover.
-   - **DB size**, **active backends**, **TPS**, **tuple ops** — workload signal.
-   - **Replication lag bytes / seconds**, **WAL receiver up/down** — failover signal.
-   - **Connections by state** — pool pressure during the load test.
-2. Walk to the Load tab on the monitor app, pick **Morning** preset (50 RPS),
-   and within ~10s the **TPS** and **tuple ops** panels light up on the
-   current primary's cloud.
-3. Trigger a failover from the monitor's Topology tab. Within 30-60s:
-   - The **Cluster role** panel on the new primary flips PRIMARY (green).
-   - **Replication lag seconds** spikes briefly on the new replica then settles.
-   - **WAL receiver up** drops to 0 on the old primary, comes back up as
-     replica.
-
-> **Operator gotcha (May 2026 preview):** CNPG's built-in metrics exporter
-> hits a `permission denied for schema documentdb_core` error on every
-> query because the documentdb extension's auth hook fires on the BIND
-> phase of `pgx`'s named prepared statements. We deploy
-> `prometheuscommunity/postgres-exporter` (lib/pq, no prepared statements)
-> instead. The `cnpg_monitor` role + grants are already replicated via
-> WAL — you do **not** need to recreate them after a failover.
-
-## L) Load tester (Load tab in the monitor app)
-
-The Load tab simulates a realistic bookings site mix against the **current
-primary** so the Grafana panels (and the monitor's own Bookings tab) have
-something to show during a failover demo.
-
-| Operation | Mix  | Target collection            | What it does                           |
-|-----------|------|------------------------------|----------------------------------------|
-| browse    | 80%  | `bookingsdb.listings`        | `find {city, price<=X}` sort+limit 20  |
-| detail    | 15%  | `bookingsdb.listings`        | `findOne by _id` from sample cache     |
-| insert    | 4%   | `bookingsdb.loadgen_bookings`| insert one fake booking                |
-| update    | 1%   | `bookingsdb.loadgen_bookings`| confirm a recent loadgen booking       |
-
-The writer collection (`loadgen_bookings`) is **separate** from the demo
-Bookings tab's `bookings` collection so the on-screen Bookings list stays
-clean and readable; the load tester never pollutes it.
-
-**Presets** (RPS slider 0-500):
-- **Idle** (5 RPS) — quiet baseline, just enough to keep panels alive.
-- **Morning** (50 RPS) — cruising load, recommended for the failover demo.
-- **Peak** (150 RPS) — visible commit/TPS activity on Grafana.
-- **Black Friday** (400 RPS) — stress mode; only run if pool sizes are
-  generous on the primary (see `maxPoolSize` in `server.js`).
-
-**Demo beats:**
-
-1. Drop the writer collection first via **Drop loadgen_bookings** so the
-   `total_ops` counter starts clean.
-2. Pick a preset (or set a custom RPS), click **Start**.
-3. Watch **observed_rps** climb to match the slider value within ~5s, and
-   **p50/p95/p99 latency** stay below ~50ms on a healthy cluster.
-4. During a failover, p95/p99 spike briefly (3-10s) and the per-op error
-   counts tick up; once the new primary is writeable, latencies recover.
-
-> **Tuning notes:**
-> - Pool size: `maxPoolSize: 32, minPoolSize: 2` in `server.js`. Bump to
->   64+ if you sustain >200 RPS with high latency.
-> - The listings sample cache TTL is 5 minutes (500 docs). If you reseed
->   `listings` mid-demo, restart the monitor app to pick up fresh `_id`s.
-
+```

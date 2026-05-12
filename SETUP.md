@@ -118,6 +118,38 @@ bash infra/multi-cloud/deploy.sh
 bash infra/multi-cloud/deploy-documentdb.sh
 ```
 
+### Phase 3b: Load the demo dataset
+
+Once the DocumentDB CR is healthy on both clouds, load the
+`bookingsdb.listings` dataset onto the primary. **You do not need to know
+which cloud is primary, the endpoint, or the password** — the script
+discovers all of that from the Fleet hub:
+
+```powershell
+# From the repo root (Windows)
+.\load-data.bat
+```
+
+```bash
+# Or, if you're on Linux/WSL with the same kubectl contexts:
+MONGODB_URI="mongodb://docdb:$(kubectl --context azure-documentdb -n documentdb-preview-ns get secret documentdb-credentials -o jsonpath='{.data.password}' | base64 -d)@127.0.0.1:57100/?tls=true&tlsAllowInvalidCertificates=true&directConnection=true" bash data/load-data.sh
+# (the Windows wrapper above handles the port-forward automatically; on Linux,
+#  run kubectl port-forward svc/documentdb-service-documentdb-preview 57100:10260 in another shell first)
+```
+
+The Windows wrapper:
+
+1. Reads `spec.clusterReplication.primary` from the DocumentDB CR on the hub to find which cloud is currently primary
+2. Pulls the `docdb` user password from the `documentdb-credentials` Secret
+3. Sets up a temporary `kubectl port-forward` to that cluster's gateway service
+4. Runs `mongoimport` (or falls back to `mongosh`) to load `data/listings_vectors.json`
+5. Creates the cosmosSearch vector index + four query indexes
+6. Tears down the port-forward
+
+WAL replication carries the dataset to the replica cloud automatically — verify
+with `kubectl --context <replica-context> exec ...` or via the monitor app's
+Bookings tab.
+
 This will:
 1. Create Azure RG `docdb-multicloud-rg` in `eastus2`
 2. Deploy AKS Fleet `aks-fleet-hub-fleet` + AKS member `azure-documentdb` via Bicep
@@ -135,6 +167,37 @@ This will:
 Single-cluster fallbacks (`infra/azure/deploy.sh`, `infra/aws/deploy.sh`) are
 still available if you want a one-cloud-at-a-time demo, but the talk targets
 the multi-cloud stack.
+
+### Phase 4: Launch the monitor + Grafana dashboards
+
+Once both clouds are deployed and `kubectl --context azure-documentdb` /
+`aws-documentdb` work, start the demo UI from the repo root:
+
+```powershell
+# From PowerShell (Windows)
+.\start.ps1
+```
+
+```cmd
+:: Or from cmd.exe / a double-click
+start.bat
+```
+
+This single command:
+
+- Sets the monitor app's env vars (`DDB_HUB_CONTEXT=hub`,
+  `DDB_MEMBER_CONTEXTS=azure-documentdb,aws-documentdb`, `PORT=5174`, etc.)
+- Opens the monitor app at <http://localhost:5174>
+- Opens both Grafana dashboards in your browser (Azure + AWS LoadBalancer URLs;
+  anonymous Viewer, no login)
+- Starts `node server.js`, which spawns its own `kubectl port-forward` tunnels
+  to each cluster's DocumentDB gateway — **no manual port-forward terminals
+  needed**
+
+Flags: `.\start.ps1 -NoGrafana` skips the Grafana tabs;
+`.\start.ps1 -NoBrowser` skips all tabs (handy when rehearsing the server
+alone). First run requires `npm install` in `app/monitor-app/` — see
+[`app/monitor-app/README.md`](app/monitor-app/README.md).
 
 ---
 
