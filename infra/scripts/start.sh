@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Configuration
+MC_RG="${MC_RG:-${RESOURCE_GROUP:-docdb-multicloud-rg}}"
 RESOURCE_GROUP="${RESOURCE_GROUP:-docdb-demo-rg}"
 AKS_CLUSTER="${AKS_CLUSTER:-docdb-demo-aks}"
 EKS_CLUSTER="${EKS_CLUSTER:-docdb-demo-eks}"
@@ -19,7 +20,6 @@ echo ""
 
 # Check prerequisites
 command -v az >/dev/null 2>&1 || { echo "❌ Azure CLI required"; exit 1; }
-command -v aws >/dev/null 2>&1 || { echo "❌ AWS CLI required"; exit 1; }
 command -v kubectl >/dev/null 2>&1 || { echo "❌ kubectl required"; exit 1; }
 command -v helm >/dev/null 2>&1 || { echo "❌ Helm required"; exit 1; }
 
@@ -61,43 +61,40 @@ case $choice in
     # The multi-cloud playground stands up a fresh fleet hub, AKS member,
     # and EKS member with a real Istio mesh between them. It is NOT designed
     # to start/stop incrementally — if the fleet doesn't exist, deploy it.
-    MC_RG="${MC_RG:-docdb-multicloud-rg}"
+    export RESOURCE_GROUP="$MC_RG"
+    source "$REPO_ROOT/infra/multi-cloud/config.sh"
     if az group show --name "$MC_RG" --output none 2>/dev/null \
        && az fleet list -g "$MC_RG" --query "[0].name" -o tsv 2>/dev/null | grep -q .; then
       echo "Multi-cloud stack already deployed in $MC_RG."
       echo "Refreshing kubectl contexts..."
       FLEET_NAME=$(az fleet list -g "$MC_RG" --query "[0].name" -o tsv)
       az fleet get-credentials --resource-group "$MC_RG" --name "$FLEET_NAME" --overwrite-existing
-      az aks get-credentials --resource-group "$MC_RG" --name "${AKS_CLUSTER_NAME:-azure-documentdb}" --overwrite-existing
-      aws eks update-kubeconfig --name "${EKS_CLUSTER_NAME:-aws-documentdb}" --region "$EKS_REGION"
+      for member in "${AKS_MEMBER_NAMES[@]}"; do
+        az aks get-credentials --resource-group "$MC_RG" --name "$member" --context "$member" --overwrite-existing
+      done
+      if [ "$INCLUDE_EKS" = true ]; then
+        aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$EKS_REGION" --alias "$EKS_CLUSTER_NAME"
+      fi
     else
       echo "Multi-cloud stack not found. Deploying (~25-35 min)..."
       bash "$REPO_ROOT/infra/multi-cloud/deploy.sh"
       echo ""
       echo "Now deploying DocumentDB across the mesh..."
-      DELETE_EXISTING=true bash "$REPO_ROOT/infra/multi-cloud/deploy-documentdb.sh"
+      bash "$REPO_ROOT/infra/multi-cloud/deploy-documentdb.sh"
     fi
     echo ""
     echo "✅ Multi-cloud ready. Contexts:"
-    echo "  hub                    (Fleet hub)"
-    echo "  azure-documentdb       (AKS member)"
-    echo "  aws-documentdb         (EKS member)"
+    echo "  $HUB_CONTEXT (Fleet hub)"
+    printf '  %s\n' "${MEMBER_CLUSTER_NAMES[@]}"
     echo ""
     echo "Status:"
-    kubectl --context hub get clusterresourceplacement 2>/dev/null || true
+    kubectl --context "$HUB_CONTEXT" get clusterresourceplacement
     ;;
   4)
     echo ""
     echo "=== Starting local DocumentDB ==="
-    docker start docdb 2>/dev/null || {
-      echo "Container not found. Creating..."
-      docker pull ghcr.io/documentdb/documentdb/documentdb-local:latest
-      docker run -dt -p 10260:10260 --name docdb \
-        ghcr.io/documentdb/documentdb/documentdb-local:latest \
-        --username demo --password test
-    }
-    echo "✅ DocumentDB local running on port 10260"
-    echo "Connect: mongosh \"mongodb://demo:test@localhost:10260/?tls=true&tlsAllowInvalidCertificates=true\""
+    docker compose -f "$REPO_ROOT/docker-compose.yml" up -d
+    echo "DocumentDB local running on port 27017"
     ;;
   *)
     echo "Invalid selection"

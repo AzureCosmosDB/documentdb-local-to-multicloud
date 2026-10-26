@@ -1,3 +1,5 @@
+# Historical preview-only operator propagation. Do not apply to GA deployments.
+# deploy.sh installs published charts independently on the hub and members.
 apiVersion: placement.kubernetes-fleet.io/v1beta1
 kind: ClusterResourcePlacement
 metadata:

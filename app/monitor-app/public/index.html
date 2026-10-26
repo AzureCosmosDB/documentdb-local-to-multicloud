@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>DocumentDB Multi-Cloud Monitor</title>
   <script>
     (() => {
@@ -13,8 +14,8 @@
   <style>
     :root {
       color-scheme: light;
-      --cp-bg: #f7f4ef;
-      --cp-bg-elevated: #fcfbf8;
+      --cp-bg: #f5f4f2;
+      --cp-bg-elevated: #ffffff;
       --cp-surface: #ffffff;
       --cp-surface-soft: #f5f5f5;
       --cp-border: #dedede;
@@ -26,9 +27,9 @@
       --cp-accent-hover: #9a1a41;
       --cp-accent-soft: rgba(177, 31, 75, 0.08);
       --cp-accent-fg: #ffffff;
-      --cp-success: #16a34a;
-      --cp-danger: #dc2626;
-      --cp-warning: #f59e0b;
+      --cp-success: #15703d;
+      --cp-danger: #b91c1c;
+      --cp-warning: #895200;
       --cp-link: #0078d4;
       --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.12);
       --cp-overlay: rgba(255, 255, 255, 0.8);
@@ -39,14 +40,14 @@
     }
     html[data-theme="dark"] {
       color-scheme: dark;
-      --cp-bg: #3d3b3a;
-      --cp-bg-elevated: #343231;
-      --cp-surface: #292929;
-      --cp-surface-soft: #2e2e2e;
-      --cp-border: #474747;
-      --cp-border-strong: #5f5f5f;
-      --cp-text: #dedede;
-      --cp-text-muted: #919191;
+      --cp-bg: #201f1e;
+      --cp-bg-elevated: #262523;
+      --cp-surface: #292826;
+      --cp-surface-soft: #302f2c;
+      --cp-border: #484642;
+      --cp-border-strong: #79756f;
+      --cp-text: #efede9;
+      --cp-text-muted: #b5b1aa;
       --cp-text-soft: #b0b0b0;
       --cp-accent: #fd8ea1;
       --cp-accent-hover: #fb7b91;
@@ -70,9 +71,11 @@
       background: var(--cp-bg);
       color: var(--cp-text);
       min-height: 100vh;
+      font-size: 14px;
+      line-height: 1.5;
     }
     header {
-      padding: 24px 32px;
+      padding: 28px max(24px, calc((100% - 1336px) / 2));
       background: var(--cp-bg-elevated);
       border-bottom: 1px solid var(--cp-border);
       display: flex;
@@ -81,28 +84,43 @@
       flex-wrap: wrap;
       gap: 12px;
     }
-    h1 { margin: 0; font-size: 20px; font-weight: 600; }
+    h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.02em; }
+    h3 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: var(--cp-text-muted); }
     .subtitle { color: var(--cp-text-muted); font-size: 13px; margin-top: 4px; }
-    .failover-timer { color: var(--cp-text-muted); font-size: 11px; opacity: 0.65; font-variant-numeric: tabular-nums; margin-top: 2px; }
+    .failover-timer { color: var(--cp-text-muted); font-size: 12px; font-variant-numeric: tabular-nums; margin-top: 2px; }
     .failover-timer strong { font-weight: 600; color: var(--cp-text-soft); }
-    main { padding: 24px 32px; max-width: 1400px; margin: 0 auto; }
+    main { padding: 28px 32px 48px; max-width: 1400px; margin: 0 auto; }
     .toolbar {
       display: flex;
       gap: 8px;
       align-items: center;
+      flex-wrap: wrap;
     }
     button {
       font-family: inherit;
       font-size: 13px;
       padding: 8px 14px;
-      border-radius: 0.625rem;
-      border: 1px solid var(--cp-border);
+      border-radius: 6px;
+      border: 1px solid var(--cp-border-strong);
       background: var(--cp-surface);
       color: var(--cp-text);
       cursor: pointer;
       transition: background 0.15s;
+      min-height: 38px;
+      font-weight: 500;
     }
     button:hover { background: var(--cp-surface-soft); }
+    button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
+      outline: 2px solid var(--cp-accent);
+      outline-offset: 3px;
+    }
+    button:active:not(:disabled) { background: var(--cp-highlight); }
+    input, select { font: inherit; accent-color: var(--cp-accent); }
+    input[type="number"] {
+      padding: 7px 8px; border: 1px solid var(--cp-border-strong); border-radius: 4px;
+      color: var(--cp-text); background: var(--cp-surface);
+    }
+    input::placeholder { color: var(--cp-text-muted); opacity: 1; }
     button.primary {
       background: var(--cp-accent);
       color: var(--cp-accent-fg);
@@ -117,35 +135,36 @@
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
-      gap: 20px;
-      margin-top: 20px;
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
+      gap: 24px;
+      margin-top: 24px;
     }
     .card {
       background: var(--cp-surface);
       border: 1px solid var(--cp-border);
-      border-radius: 16px;
-      padding: 20px;
-      box-shadow: 0 0 2px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.14);
+      border-radius: 6px;
+      padding: 24px;
+      min-width: 0;
     }
     .card-head {
       display: flex;
       justify-content: space-between;
       align-items: flex-start;
-      margin-bottom: 12px;
+      margin-bottom: 20px;
+      gap: 16px;
     }
-    .cluster-name { font-size: 16px; font-weight: 600; }
+    .cluster-name { font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
     .cluster-ctx { font-family: Consolas, "Courier New", Courier, monospace; font-size: 12px; color: var(--cp-text-muted); margin-top: 2px; }
     .badge {
       display: inline-block;
       padding: 4px 10px;
-      border-radius: 999px;
+      border-radius: 4px;
       font-size: 11px;
       font-weight: 600;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
+      letter-spacing: 0.01em;
+      line-height: 1.5;
     }
-    .badge.primary { background: #16a34a; color: #ffffff; }
+    .badge.primary { background: #15703d; color: #ffffff; }
     html[data-theme="dark"] .badge.primary { background: #15803d; color: #ffffff; }
     .badge.replica { background: var(--cp-accent-soft); color: var(--cp-accent); }
     .badge.healthy { background: rgba(22,163,74,0.12); color: var(--cp-success); }
@@ -154,7 +173,7 @@
     .row {
       display: flex;
       justify-content: space-between;
-      padding: 8px 0;
+      padding: 10px 0;
       border-top: 1px solid var(--cp-border);
       font-size: 13px;
     }
@@ -193,7 +212,7 @@
       margin-top: 24px;
       background: var(--cp-surface);
       border: 1px solid var(--cp-border);
-      border-radius: 16px;
+      border-radius: 6px;
       padding: 16px;
       font-family: Consolas, "Courier New", Courier, monospace;
       font-size: 12px;
@@ -215,7 +234,7 @@
     }
     .meta-bar {
       display: flex;
-      gap: 24px;
+      gap: 8px 24px;
       flex-wrap: wrap;
       font-size: 12px;
       color: var(--cp-text-muted);
@@ -234,7 +253,7 @@
     .tabs {
       display: flex;
       gap: 4px;
-      padding: 0 32px;
+      padding: 0 max(24px, calc((100% - 1336px) / 2));
       background: var(--cp-bg-elevated);
       border-bottom: 1px solid var(--cp-border);
     }
@@ -256,16 +275,16 @@
     .pane.active { display: block; }
     .data-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
-      gap: 20px;
-      margin-top: 20px;
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
+      gap: 24px;
+      margin-top: 24px;
     }
     .data-card {
       background: var(--cp-surface);
       border: 1px solid var(--cp-border);
-      border-radius: 16px;
-      padding: 20px;
-      box-shadow: 0 0 2px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.14);
+      border-radius: 6px;
+      padding: 24px;
+      min-width: 0;
       display: flex;
       flex-direction: column;
       min-height: 420px;
@@ -276,7 +295,7 @@
       max-height: 460px;
       margin-top: 10px;
       border: 1px solid var(--cp-border);
-      border-radius: 0.625rem;
+      border-radius: 4px;
       background: var(--cp-surface-soft);
     }
     .data-row {
@@ -380,6 +399,32 @@
     }
     .stat-box .stat-label { color: var(--cp-text-muted); display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; }
     .stat-box .stat-val { color: var(--cp-text); font-weight: 600; font-size: 14px; font-family: Consolas, "Courier New", Courier, monospace; margin-top: 2px; }
+    .stat-box { border-radius: 4px; text-align: left; }
+    .stat-box .stat-label { text-transform: none; letter-spacing: normal; font-size: 12px; }
+    .vs-example { margin: 4px 2px; font-size: 12px; }
+    .reason, .err, .meta-bar, .cluster-ctx { overflow-wrap: anywhere; }
+    .replication-table { display: block; overflow-x: auto; }
+    #pane-load .grid { gap: 12px; }
+    #pane-load .grid .card { padding: 18px; }
+    #pane-load .grid .card > div { font-variant-numeric: tabular-nums; }
+    #pane-load .toolbar > div { flex-wrap: wrap; }
+    @media (max-width: 640px) {
+      header { padding: 20px 16px 16px; gap: 20px; }
+      main { padding: 20px 16px 32px; }
+      .tabs { padding: 0 8px; overflow-x: auto; }
+      .tab { padding: 12px; white-space: nowrap; }
+      .card, .data-card { padding: 16px; }
+      .card-head { flex-wrap: wrap; gap: 12px; }
+      button { min-height: 44px; }
+      #vsQuery { min-width: 0 !important; flex-basis: 100% !important; }
+      #lgRps { width: auto !important; min-width: 80px; flex: 1; }
+      #pane-load .toolbar > label { max-width: 100%; }
+      .data-stats { gap: 4px; }
+      .booking-row { grid-template-columns: minmax(0, 1fr); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
   </style>
 </head>
 <body>
@@ -568,7 +613,7 @@
       const isWalReceiverDown = /wal receiver is not running/i.test(r) ||
         /wal receiver/i.test(r);
       if (allMembersPhaseHealthy && isWalReceiverDown) {
-        const replica = data.clusters.find((c) => c.role !== "PRIMARY");
+        const replica = data.clusters.find((c) => c.context === rep.context);
         return {
           state: "rebuild-required",
           primary: primary.context,
@@ -640,7 +685,7 @@
         const promoteBtn = c.role !== "PRIMARY"
           ? `<button class="primary" data-promote="${c.context}" ${promoteDisabled ? "disabled" : ""} title="${promoteTitle.replace(/"/g, "&quot;")}">Promote to primary</button>`
           : "";
-        const hasStaleToken = !c.healthy && /promotion token/i.test(c.phaseReason || "");
+        const hasStaleToken = data.legacyRecovery && !c.healthy && /promotion token/i.test(c.phaseReason || "");
         const fixTokenBtn = hasStaleToken
           ? `<button class="danger" data-fix="${c.context}" title="Remove the stale promotionToken from spec.replica. Use this if you want the operator to retry without forcing promotion.">Clear stale token</button>`
           : "";
@@ -1165,11 +1210,11 @@ db.listings.aggregate([
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ context: rctx, ids, timeoutSec: 15 }),
           }).then((r) => r.json());
-          if (w.ok && w.lagMs != null) {
+          if (w.ok && !w.timedOut && w.lagMs != null) {
             ids.forEach((id) => {
               const t = insertTimings.get(id) || {};
-              t.replicaLagMs = w.lagMs;
-              t.measuringReplica = false;
+              t.replicas ||= {};
+              t.replicas[rctx] = { replicaLagMs: w.lagMs, measuringReplica: false };
               insertTimings.set(id, t);
             });
           }
@@ -1211,7 +1256,8 @@ db.listings.aggregate([
           bodyHtml = res.rows.map((row) => {
             const isNew = !seen.has(row.id);
             let lagBadge = "";
-            const t = insertTimings.get(row.id);
+            const timing = insertTimings.get(row.id);
+            const t = timing?.replicas?.[ctx] || timing;
             if (t && !isPrimary && t.replicaLagMs != null) {
               lagBadge = `<span class="lag-col" title="server-measured Postgres replication lag from primary commit to replica visibility">+${t.replicaLagMs}ms</span>`;
             } else if (t && !isPrimary && t.measuringReplica) {
@@ -1323,7 +1369,7 @@ db.listings.aggregate([
         return null;
       }
       $("dataError").innerHTML = "";
-      const deleted = new Set(j.deleted || []);
+      const deleted = new Set(j.deleted === ids.length ? ids : []);
       for (let i = myInsertedIds.length - 1; i >= 0; i--) {
         if (deleted.has(myInsertedIds[i])) myInsertedIds.splice(i, 1);
       }

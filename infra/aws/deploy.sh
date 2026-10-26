@@ -21,7 +21,7 @@ if [[ "$(uname -s)" == *MINGW* ]] || [[ "$(uname -s)" == *MSYS* ]] || [[ "$(unam
 fi
 
 # Verify required tools (check both 'cmd' and 'cmd.exe' for WSL compatibility)
-for cmd in aws kubectl helm eksctl; do
+for cmd in aws kubectl helm eksctl jq; do
   if ! command -v "$cmd" &>/dev/null && ! command -v "${cmd}.exe" &>/dev/null; then
     echo "ERROR: Required tool not found: $cmd"
     echo "   Install it and ensure it is on your PATH."
@@ -31,7 +31,7 @@ for cmd in aws kubectl helm eksctl; do
 done
 echo "All required tools found."
 # WSL shim: if 'cmd' isn't found but 'cmd.exe' is, create aliases
-for cmd in aws kubectl helm eksctl mongosh; do
+for cmd in aws kubectl helm eksctl jq mongosh; do
   if ! command -v "$cmd" &>/dev/null && command -v "${cmd}.exe" &>/dev/null; then
     eval "function $cmd() { ${cmd}.exe \"\$@\"; }"
     export -f "$cmd" 2>/dev/null || true
@@ -92,17 +92,8 @@ EOF
 echo ""
 echo "=== Installing DocumentDB operator ==="
 
-# Install cert-manager (idempotent via apply)
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
-echo "Waiting for cert-manager..."
-kubectl wait --for=condition=available --timeout=180s deployment/cert-manager -n cert-manager
-kubectl wait --for=condition=available --timeout=180s deployment/cert-manager-webhook -n cert-manager
-
-# Install DocumentDB operator (helm upgrade --install for idempotency)
-helm repo add documentdb https://documentdb.github.io/documentdb-kubernetes-operator 2>/dev/null || true
-helm repo update
-helm upgrade --install documentdb-operator documentdb/documentdb-operator \
-  --namespace documentdb-operator --create-namespace
+source "$REPO_ROOT/infra/versions.sh"
+install_documentdb_operator eks-demo
 
 echo "Waiting for operator..."
 kubectl wait --for=condition=available --timeout=180s deployment/documentdb-operator -n documentdb-operator
@@ -132,6 +123,7 @@ metadata:
   name: docdb-demo
   namespace: documentdb-ns
 spec:
+  documentDBVersion: "$DOCUMENTDB_VERSION"
   environment: eks
   nodeCount: 1
   instancesPerNode: 1

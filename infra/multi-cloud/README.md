@@ -1,136 +1,149 @@
-# Multi-cloud DocumentDB (AKS Fleet + Istio mesh + WAL replication)
+# DocumentDB regional and multi-cloud deployment
 
-This is the **vendored, AKS+EKS-default** version of the upstream
-[`documentdb-playground/multi-cloud-deployment`](https://github.com/documentdb/documentdb-kubernetes-operator/tree/main/documentdb-playground/multi-cloud-deployment).
+One DocumentDB resource, replicated by PostgreSQL WAL across separate Kubernetes
+clusters. The default remains AKS + EKS. A second AKS cluster in a different
+Azure region can replace EKS or run alongside it. This is **operator-managed
+DocumentDB on PostgreSQL**, not a separate plain PostgreSQL service.
 
-It replaces the standalone AKS (`infra/azure/`) and EKS (`infra/aws/`) deploys
-with a single fleet-managed deployment that gives **real cross-cloud
-replication** instead of two unrelated clusters.
+The Fleet hub places the database namespace, credentials and DocumentDB resource
+only on the configured members. Each cluster gets its own published operator
+chart, certificates and webhook configuration; operators are no longer copied
+from the hub. Istio east-west gateways and remote secrets connect every pair of
+members. PostgreSQL replication uses Istio mTLS on port 5432, not a public
+PostgreSQL endpoint.
 
-## What gets created
+## Prerequisites and versions
 
-| Resource | Where | Purpose |
-|---|---|---|
-| Resource group `docdb-multicloud-rg` | Azure (eastus2) | Holds the Fleet hub + AKS member |
-| AKS Fleet `aks-fleet-hub-fleet` | Azure (eastus2) | KubeFleet control plane that propagates DocumentDB CRDs/RBAC and the DocumentDB CR via `ClusterResourcePlacement` |
-| AKS member `azure-documentdb` | Azure (eastus2) | Runs a primary or replica of DocumentDB |
-| EKS cluster `aws-documentdb` | AWS (us-west-2) | Joined to the Fleet via the open-source kubefleet bootstrap; runs the other replica |
-| Istio 1.24 multi-cluster mesh | All members | Shared root CA, east-west gateways, cross-cluster service discovery + mTLS |
-| AWS NLB on `istio-eastwestgateway` | EKS | Exposes the EKS east-west gateway to the AKS east-west gateway over the public internet (mTLS-secured) |
-| DocumentDB operator | Hub → propagated to members | Manages `DocumentDB` CR, drives CNPG WAL replication |
-| `DocumentDB documentdb-preview` | namespace `documentdb-preview-ns` | The actual database; primary on AKS, WAL replica on EKS |
+See [SETUP.md](../../SETUP.md) before upgrading an existing deployment. All members
+need Kubernetes 1.35+ with ImageVolume enabled and a compatible container runtime.
+The Fleet hub must meet the operator chart's Kubernetes 1.33+ floor.
+Region availability and quotas must be checked before deploying.
 
-## How replication works (one-paragraph version)
+`infra/versions.sh` pins operator/engine **1.0.0**, cert-manager **1.21.3**,
+Istio **1.30.7**, and kube-prometheus-stack **92.14.0**. The operator chart
+includes CNPG chart **0.28.3**. Istio 1.31.3 has a GitHub release but its chart was
+not available in either official chart registry when checked on 2026-10-26;
+1.30.7 was the latest stable published chart that rendered successfully.
+Fleet bootstrap revisions remain explicitly pinned for the managed Fleet setup.
 
-The DocumentDB operator watches the `DocumentDB` CR. On the cluster that matches
-`spec.clusterReplication.primary` it creates a CNPG primary cluster; on every
-other cluster in `spec.clusterReplication.clusterList` it creates a **WAL
-replica** that subscribes to the primary's WAL stream over the Istio mesh.
-Istio's east-west gateways + remote secrets give every cluster a routable view
-of every other cluster's services (`documentdb-preview-rw.documentdb-preview-ns`
-resolves cross-cluster), so the replica's CNPG instance can stream WAL records
-from the primary as if they were on the same network — without exposing the
-Postgres port publicly.
+Required tools: Azure CLI, kubectl, Helm 3, Git, Bash, jq, curl, make, OpenSSL,
+and kubelogin. AWS CLI and eksctl are required **only when EKS is enabled**.
+The deploy script installs the Azure Fleet CLI extension if missing.
+The monitor additionally needs Node.js 24 LTS and the local
+[`kubectl documentdb` plugin](../../SETUP.md#kubectl-plugin).
 
-`kubectl documentdb promote` flips which cluster is primary by reconfiguring the
-CR; the new primary's CNPG cluster is promoted, the old primary becomes a
-replica, and (if Azure DNS is enabled) the SRV record is updated so MongoDB
-clients reconnect automatically.
+## Provisioning
 
-## Quick start
+These commands create billable resources. Nothing is deployed by installing
+the monitor's npm dependencies or running its tests.
 
 ```bash
-# Stand up infra (AKS Fleet + AKS + EKS + Istio + operator). ~25-35 min.
+# Original AKS + EKS path:
+az login
+aws sso login
 bash infra/multi-cloud/deploy.sh
-
-# Deploy a DocumentDB cluster (primary defaults to AKS).
 bash infra/multi-cloud/deploy-documentdb.sh
-# Save the printed password.
+bash monitoring/deploy.sh
 ```
 
-## Configuration (env vars)
+For Azure-only regional failover, choose an available second region explicitly:
 
-| Var | Default | Notes |
+```bash
+export INCLUDE_EKS=false
+export INCLUDE_AKS_REPLICA=true
+export AKS_REPLICA_REGION="<second-region>"
+export RESOURCE_GROUP="docdb-regional-rg"
+
+az login
+bash infra/multi-cloud/deploy.sh
+bash infra/multi-cloud/deploy-documentdb.sh
+bash monitoring/deploy.sh
+```
+
+Set `INCLUDE_EKS=true` with the same regional settings to use all three members.
+Use the **same exported configuration** for deployment, monitoring, refresh and
+cleanup. Each member name must be unique and must also be its kubeconfig context
+and Fleet member name. Cloud/provider names are never used as unique identities.
+
+| Variable | Default | Meaning |
 |---|---|---|
-| `RESOURCE_GROUP` | `docdb-multicloud-rg` | Azure RG that holds Fleet hub + AKS member |
-| `RG_LOCATION` / `HUB_REGION` / `AKS_REGION` | `eastus2` | Azure regions |
-| `AKS_CLUSTER_NAME` | `azure-documentdb` | AKS member name; also kubectl context |
-| `EKS_CLUSTER_NAME` | `aws-documentdb` | EKS cluster name; also kubectl context |
-| `EKS_REGION` | `us-west-2` | AWS region |
-| `EKS_NODE_TYPE` | `m5.large` | EKS node SKU |
-| `HUB_VM_SIZE` | (Bicep default `Standard_DS3_v2`) | AKS member VM SKU |
-| `INCLUDE_GKE` | `false` | Set `true` to add a GKE member; requires `PROJECT_ID`, `GCP_USER`, `gcloud` |
-| `OPERATOR_CHART_DIR` | auto | Local path to `documentdb-helm-chart`; if unset we look for a sibling `documentdb-kubernetes-operator/` clone and create one if missing |
-| `VERSION` | `200` | Operator chart `0.0.<VERSION>` package version |
-| `PRIMARY_CLUSTER` | `$AKS_CLUSTER_NAME` | Which member starts as primary |
-| `ENABLE_AZURE_DNS` | `false` | Skip Azure DNS zone management; set `true` plus `AZURE_DNS_PARENT_ZONE_RESOURCE_ID` to expose the cluster as a `mongodb+srv://` URL |
-| `DELETE_EXISTING` | (prompt) | `true` recreates DocumentDB resources non-interactively, `false` updates in place |
+| `RESOURCE_GROUP` | `docdb-multicloud-rg` | Dedicated Azure RG, deleted in full by cleanup |
+| `RG_LOCATION`, `HUB_REGION`, `AKS_REGION` | `eastus2` | RG, hub and first member locations |
+| `AKS_CLUSTER_NAME` | `azure-documentdb` | First AKS member/context |
+| `INCLUDE_AKS_REPLICA` | `false` | Provision second AKS member |
+| `AKS_REPLICA_NAME` | `azure-documentdb-secondary` | Second AKS member/context |
+| `AKS_REPLICA_REGION` | none | Required, different from `AKS_REGION` |
+| `INCLUDE_EKS` | `true` | Provision/use EKS |
+| `EKS_CLUSTER_NAME`, `EKS_REGION` | `aws-documentdb`, `us-west-2` | EKS identity/location |
+| `INCLUDE_GKE` | `false` | Optional GKE member; needs `GCP_PROJECT_ID`, `GCP_USER`, `gcloud` |
+| `HUB_CONTEXT` | `hub` | Fleet hub context |
+| `KUBERNETES_VERSION` | `1.35` | Supported regional version with ImageVolume |
+| `HUB_VM_SIZE` | `Standard_DS3_v2` | AKS member node SKU |
+| `PRIMARY_CLUSTER` | first AKS member | Initial primary; updates preserve the existing primary and reject changing/removing it (use promotion first) |
+| `VALUES_FILE` | none | Additional operator Helm values |
+| `ENABLE_AZURE_DNS` | `false` | Optional DNS; see deployment script's zone settings |
+| `DELETE_EXISTING` | `false` | `true` explicitly deletes existing database resources; otherwise prompts |
 
-## Failover
+Generated passwords are stored in the credentials Secret and not printed.
+Updating a database reuses its existing credentials. `--render` is cloud-free:
 
 ```bash
-# Promote EKS to primary
-kubectl documentdb promote \
-  --documentdb documentdb-preview \
-  --namespace documentdb-preview-ns \
-  --hub-context hub \
-  --target-cluster aws-documentdb \
-  --cluster-context aws-documentdb
-
-# Promote back to AKS
-kubectl documentdb promote \
-  --documentdb documentdb-preview \
-  --namespace documentdb-preview-ns \
-  --hub-context hub \
-  --target-cluster azure-documentdb \
-  --cluster-context azure-documentdb
+DOCUMENTDB_PASSWORD=offline-example bash infra/multi-cloud/deploy-documentdb.sh --render
 ```
 
-The `kubectl documentdb` plugin ships with the operator chart and is installed
-on the hub via Helm.
+The rendered output contains a base64-encoded password. Use a dummy value for
+review and never commit real rendered Secrets. Preserve `infra/multi-cloud/certs/`
+securely when adding a member: the script refuses to silently replace a live
+mesh's missing local root CA.
 
-## Rough cost
+## Promotion and application routing
 
-| Component | $/day (running) |
-|---|---|
-| AKS Fleet hub (no node pool) | ~$0 |
-| AKS member (1× Standard_DS3_v2) | ~$5 |
-| EKS control plane | ~$2.40 |
-| EKS workers (2× m5.large) | ~$4.60 |
-| AWS NLB + cross-zone | ~$0.60 + bandwidth |
-| Disks | ~$0.15 |
-| **Total (AKS+EKS)** | **~$13/day** |
-
-GKE third leg adds another ~$8/day.
-
-## Cleanup
+Use the existing **Promote to primary** control on either replica's card.
+The monitor checks all active members, current leaders, replica sources and WAL
+receivers, serializes topology operations, then invokes the supported plugin.
+Bookings and Load resolve the current primary by member identity; Vector Search
+continues to use the local Docker instance.
 
 ```bash
+kubectl documentdb promote --documentdb documentdb-preview \
+  --namespace documentdb-preview-ns --hub-context hub \
+  --target-cluster azure-documentdb-secondary \
+  --cluster-context azure-documentdb-secondary
+```
+
+This is a **planned switchover**, requiring healthy replication and the old
+primary. Streaming status is not proof of zero lag or zero data loss. The monitor
+does not pass `--failover` or bypass health checks. An unavailable primary needs
+the upstream disaster-recovery procedure, including fencing and an explicit
+data-loss decision. Do not run multiple monitor processes to operate the same
+topology concurrently.
+
+The monitor does not change external DNS. If optional Azure DNS is used, update
+the SRV record only after the new primary has completed promotion.
+
+## Monitoring and cleanup
+
+`monitoring/deploy.sh` installs Grafana/Prometheus on every enabled member. The
+operator's bundled CNPG exporter uses `monitoring/queries.yaml`; the dashboard
+uses the corresponding `cnpg_` metrics. The legacy standalone exporter manifest
+is not applied. Grafana discovery uses each member context, not hardcoded IPs.
+The bundled Grafana values expose anonymous demo dashboards; restrict access
+before using anything beyond non-sensitive demonstration data.
+
+```bash
+bash infra/multi-cloud/cleanup.sh       # displays scope and asks for "destroy"
+# Explicit noninteractive destruction:
 bash infra/multi-cloud/cleanup.sh -y --wait
 ```
 
-## Differences from upstream
+Cleanup deletes the whole configured Azure RG, including both AKS members,
+and only the enabled external-cloud members/contexts. Do not share that RG with
+unrelated resources. A second AKS region adds node, disk, gateway and inter-region
+traffic costs; it does not eliminate infrastructure cost.
 
-* GKE is **opt-in** (`INCLUDE_GKE=true`) — upstream always deploys GKE.
-* Operator helm chart is loaded from a sibling clone (so this directory stays
-  small); upstream expects the script to live inside the operator repo.
-* Default resource group is `docdb-multicloud-rg` (upstream uses
-  `documentdb-aks-fleet-rg`).
-* `deploy-documentdb.sh` defaults primary to **AKS** (closest to the Fleet hub).
-  Upstream defaults to whatever `${CLUSTER_ARRAY[1]}` resolves to (AKS in their
-  ordering, but the choice was implicit).
-* `ENABLE_AZURE_DNS` defaults to `false` (no DNS zone management for the demo).
-* `DELETE_EXISTING` env var lets `deploy-documentdb.sh` run non-interactively.
-* `cleanup.sh` added to mirror the Azure / AWS standalone cleanup style.
+## Sources
 
-## Re-syncing from upstream
-
-```bash
-git -C ~/GitHub/DocumentDB/documentdb-kubernetes-operator pull
-diff -u ~/GitHub/DocumentDB/documentdb-kubernetes-operator/documentdb-playground/multi-cloud-deployment/main.bicep \
-        infra/multi-cloud/main.bicep
-```
-
-The Bicep / YAML / `dns_failover.sh` files in this folder are unmodified copies
-from upstream (only `deploy.sh`, `deploy-documentdb.sh`, `cleanup.sh`, and this
-README were rewritten).
+- [Operator 1.0.0 release and migration requirements](https://github.com/documentdb/documentdb-kubernetes-operator/releases/tag/1.0.0)
+- [Released promotion implementation](https://github.com/documentdb/documentdb-kubernetes-operator/blob/1.0.0/documentdb-kubectl-plugin/cmd/promote.go)
+- [Released replication/token cleanup](https://github.com/documentdb/documentdb-kubernetes-operator/blob/1.0.0/operator/src/internal/controller/physical_replication.go)
+- [AKS multi-region guidance](https://learn.microsoft.com/azure/aks/reliability-multi-region-deployment-models)

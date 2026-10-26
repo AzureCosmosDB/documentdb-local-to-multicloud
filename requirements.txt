@@ -1,2 +1,2 @@
-pymongo>=4.6.0
-pytest>=7.4.0
+pymongo==4.19.0
+pytest==9.1.1

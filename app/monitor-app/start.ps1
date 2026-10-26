@@ -6,22 +6,50 @@
 [CmdletBinding()]
 param(
     [switch]$NoBrowser,
-    [switch]$NoGrafana
+    [switch]$NoGrafana,
+    [string[]]$MemberContexts,
+    [string]$HubContext
 )
 
 $ErrorActionPreference = "Stop"
 $env:PATH = "$env:USERPROFILE\bin;$env:USERPROFILE\.azure-kubelogin;$env:PATH"
 $env:PORT = if ($env:PORT) { $env:PORT } else { "5174" }
-$env:DDB_NAMESPACE = "documentdb-preview-ns"
-$env:DDB_RESOURCE = "documentdb-preview"
-$env:DDB_HUB_CONTEXT = "hub"
-$env:DDB_MEMBER_CONTEXTS = "azure-documentdb,aws-documentdb"
-$env:DDB_DEMO_DATABASE = "bookingsdb"
+$env:DDB_NAMESPACE = if ($env:DDB_NAMESPACE) { $env:DDB_NAMESPACE } else { "documentdb-preview-ns" }
+$env:DDB_RESOURCE = if ($env:DDB_RESOURCE) { $env:DDB_RESOURCE } else { "documentdb-preview" }
+$env:DDB_HUB_CONTEXT = if ($HubContext) { $HubContext } elseif ($env:DDB_HUB_CONTEXT) { $env:DDB_HUB_CONTEXT } elseif ($env:HUB_CONTEXT) { $env:HUB_CONTEXT } else { "hub" }
+if ($MemberContexts) {
+    $env:DDB_MEMBER_CONTEXTS = $MemberContexts -join ","
+} elseif (-not $env:DDB_MEMBER_CONTEXTS) {
+    $members = @(if ($env:AKS_CLUSTER_NAME) { $env:AKS_CLUSTER_NAME } else { "azure-documentdb" })
+    if ($env:INCLUDE_AKS_REPLICA -eq "true") {
+        $members += if ($env:AKS_REPLICA_NAME) { $env:AKS_REPLICA_NAME } else { "azure-documentdb-secondary" }
+    }
+    if ($env:INCLUDE_EKS -ne "false") {
+        $members += if ($env:EKS_CLUSTER_NAME) { $env:EKS_CLUSTER_NAME } else { "aws-documentdb" }
+    }
+    if ($env:INCLUDE_GKE -eq "true") {
+        $members += if ($env:GKE_CLUSTER_NAME) { $env:GKE_CLUSTER_NAME } else { "gcp-documentdb" }
+    }
+    $env:DDB_MEMBER_CONTEXTS = $members -join ","
+}
+$env:DDB_DEMO_DATABASE = if ($env:DDB_DEMO_DATABASE) { $env:DDB_DEMO_DATABASE } else { "bookingsdb" }
 
 # Grafana endpoints provisioned by monitoring/helm/values-kube-prometheus.yaml
 # (kube-prometheus-stack on each cluster, anonymous Viewer enabled).
-$AzureGrafana = "http://40.70.169.198/d/documentdb-failover/documentdb-failover-overview?orgId=1&refresh=10s"
-$AwsGrafana   = "http://a6d5c0d8966584a85a1e540671a3132b-947608160.us-west-2.elb.amazonaws.com/d/documentdb-failover/documentdb-failover-overview?orgId=1&refresh=10s"
+$GrafanaUrls = @()
+if (-not $NoGrafana -and -not $NoBrowser) {
+    foreach ($context in $env:DDB_MEMBER_CONTEXTS.Split(",")) {
+        $services = & kubectl --context $context.Trim() -n monitoring get service -l app.kubernetes.io/name=grafana -o json
+        if ($LASTEXITCODE -ne 0) { Write-Warning "Unable to discover Grafana on $context"; continue }
+        foreach ($service in ($services | ConvertFrom-Json).items) {
+            $ingress = $service.status.loadBalancer.ingress | Select-Object -First 1
+            $hostName = if ($ingress.hostname) { $ingress.hostname } else { $ingress.ip }
+            if ($hostName) {
+                $GrafanaUrls += "http://$hostName/d/documentdb-failover/documentdb-failover-overview?orgId=1&refresh=10s"
+            } else { Write-Warning "Grafana on $context has no LoadBalancer address yet" }
+        }
+    }
+}
 $MonitorUrl   = "http://localhost:$($env:PORT)"
 
 Set-Location -Path $PSScriptRoot
@@ -30,16 +58,14 @@ if (-not $NoBrowser) {
     Start-Process $MonitorUrl
     if (-not $NoGrafana) {
         Start-Sleep -Seconds 1
-        Start-Process $AzureGrafana
-        Start-Process $AwsGrafana
+        foreach ($url in $GrafanaUrls) { Start-Process $url }
     }
 }
 
 Write-Host ""
 Write-Host "Monitor:        $MonitorUrl"
-Write-Host "Azure Grafana:  $AzureGrafana"
-Write-Host "AWS Grafana:    $AwsGrafana"
-Write-Host "Grafana login:  anonymous Viewer (admin / techorama2026 for edit)"
+Write-Host "Members:        $env:DDB_MEMBER_CONTEXTS"
+foreach ($url in $GrafanaUrls) { Write-Host "Grafana:        $url" }
 Write-Host ""
 
 node server.js

@@ -3,10 +3,10 @@
   "image": "mcr.microsoft.com/devcontainers/python:3.11",
   "features": {
     "ghcr.io/devcontainers/features/docker-in-docker:2": {},
-    "ghcr.io/devcontainers/features/node:1": { "version": "20" },
+    "ghcr.io/devcontainers/features/node:1": { "version": "24" },
     "ghcr.io/devcontainers/features/azure-cli:1": {},
     "ghcr.io/devcontainers/features/kubectl-helm-minikube:1": {
-      "helm": "latest",
+      "helm": "3.22.1",
       "kubectl": "latest",
       "minikube": "none"
     }

@@ -1,116 +1,96 @@
 # DocumentDB Multi-Cloud Monitor
 
-Live monitoring + one-click failover dashboard for multi-cloud DocumentDB.
-
-## What it does
-
-- Polls `kubectl --context hub` for the DocumentDB CR
-- For each member cluster, fetches the CNPG cluster CR (role, phase, pods, LB)
-- For the primary, runs `pg_stat_replication` to show per-replica write/flush/replay lag
-- "Promote to primary" button shells out to `kubectl documentdb promote`
-- "Clear stale token" button (only shown on stuck clusters) does the patch fix
-- **Bookings tab** — direct Postgres reads/writes against the primary via the `pg` driver, with primary-then-replica refresh after each mutation so you can see physical replication catch up in real time
+The existing Topology, Bookings, Vector Search and Load tabs work with AKS + EKS,
+two regional AKS members, or all three. The visual refresh changes CSS, spacing,
+contrast, focus states and responsive layout, not the demo workflow.
 
 ## Run
 
-The easiest way is the repo-root launcher, which sets env vars, opens the UI,
-opens both Grafana tabs, and starts the server in one shot:
+Use Node.js 24 LTS, kubectl and the operator 1.0.0 `kubectl documentdb` plugin.
+The [deployment guide](../../infra/multi-cloud/README.md) covers prerequisites.
 
 ```powershell
-# From the repo root (documentdb-local-to-multicloud)
+npm ci --prefix app\monitor-app
 .\start.ps1
+
+# Azure-only, after deploying the regional topology:
+.\start.ps1 -MemberContexts azure-documentdb,azure-documentdb-secondary
+
+# All three:
+.\start.ps1 -MemberContexts azure-documentdb,azure-documentdb-secondary,aws-documentdb
 ```
 
-First-time setup (once per clone):
+`-NoGrafana` skips Grafana discovery/tabs; `-NoBrowser` opens no browser tabs.
+`-HubContext` overrides the Fleet context. Existing environment settings are
+preserved. When explicit contexts are absent, the launcher uses the deployment
+flags `INCLUDE_EKS`, `INCLUDE_AKS_REPLICA`, `INCLUDE_GKE` and member-name settings.
+It discovers Grafana addresses independently in each member's `monitoring`
+namespace. No IP addresses or passwords are embedded in the launcher.
+
+For a manual launch:
 
 ```powershell
-cd app\monitor-app
-npm install
-```
-
-Flags on `start.ps1`:
-
-- `-NoGrafana` — skip the two Grafana tabs
-- `-NoBrowser` — start the server without opening any tabs
-
-If you'd rather run the monitor by hand (no auto-opened tabs, no Grafana):
-
-```powershell
-cd app\monitor-app
-$env:PORT = "5174"
+$env:DDB_NAMESPACE = "documentdb-preview-ns"
+$env:DDB_RESOURCE = "documentdb-preview"
 $env:DDB_HUB_CONTEXT = "hub"
-$env:DDB_MEMBER_CONTEXTS = "azure-documentdb,aws-documentdb"
-node server.js
-# open http://localhost:5174
+$env:DDB_MEMBER_CONTEXTS = "azure-documentdb,azure-documentdb-secondary"
+node app\monitor-app\server.js
 ```
 
-Dependencies: `express`, `pg` (auto-installed by `npm install`).
+The server binds to `127.0.0.1:5174` by default. It runs with the presenter's
+Kubernetes permissions and is not an authenticated public service.
 
-## Configuration (env vars)
-
-| Var | Default |
+| Variable | Meaning |
 |---|---|
-| `PORT` | `5174` |
-| `DDB_NAMESPACE` | `documentdb-preview-ns` |
-| `DDB_RESOURCE` | `documentdb-preview` |
-| `DDB_HUB_CONTEXT` | `hub` |
-| `DDB_MEMBER_CONTEXTS` | `azure-documentdb,aws-documentdb` |
-| `KUBECTL_BIN` | `kubectl` |
+| `PORT` | Local server port, default 5174 |
+| `DDB_NAMESPACE`, `DDB_RESOURCE`, `DDB_HUB_CONTEXT` | Required when starting Node directly |
+| `DDB_MEMBER_CONTEXTS` | Required comma-separated **member names/context aliases**, not provider names |
+| `DDB_GATEWAY_USER` | Mongo gateway user, default `docdb` |
+| `DDB_DEMO_DATABASE` | Database, default `bookingsdb` |
+| `KUBECTL_BIN` | kubectl executable, default `kubectl` |
+| `LOCAL_MONGODB_URI` | Local Docker connection for Vector Search |
+| `DDB_LEGACY_RECOVERY` | Default false; explicitly opt into old preview recovery only |
 
-## Demo notes
+## Data path and safety
 
-- Clawpilot theme (auto light/dark via `prefers-color-scheme`, manual toggle in header)
-- Topology tab: status auto-refreshes every 5 seconds (toggle off if presenting and you want a stable frame)
-- Bookings tab: **event-driven** — replicas are re-fetched only after a mutation lands on the primary, so you never see "replica before primary" rendering glitches
-- Promote button streams `kubectl documentdb promote` output to the on-screen log
-- The "Clear stale token" button only appears when phase reason mentions "promotion token" — implements the gotcha fix from the workstream README
+Bookings and Load use the MongoDB driver and persistent port-forwards to
+`documentdb-service-<resource>:10260`. The current primary comes from the hub CR,
+cached for two seconds and invalidated on promotion; hub failures are not hidden
+by serving an old cached primary. Each replica has a separate connection pool
+and measured booking-replication timing. Vector Search remains local and uses
+the existing embedding configuration from the ignored `.env`.
 
-## How this app talks to Postgres (and how a real deployment would do it)
+CNPG discovery is scoped by DocumentDB ownership (single-shard demo only).
+Promotion checks every active member, its current leader and upstream source,
+and WAL streaming. The existing button invokes the supported plugin without
+`--failover` and waits for completion. Failures are shown in the operation log;
+the monitor never treats healthy pod counts alone as replication proof.
+The process serializes topology-changing requests; run only one monitor for
+a given topology. No promise of zero data loss is made.
 
-This monitor-app does NOT use a production-grade data path — it's optimized to run from a presenter's laptop with no infra changes. The patterns split into two buckets:
+Operator 1.0.0 clears stale promotion tokens itself. The monitor no longer
+patches durability settings or clears tokens automatically after promotion.
+The **Rebuild replica** control is still destructive and requires confirmation.
+It only accepts an active non-primary member with a healthy primary to rebuild
+from. Monitor status and upstream recovery guidance remain authoritative.
 
-### Real patterns (use as-is)
+There is no verified evidence that the old certificate-rebuild workaround is
+necessary on GA. It and the legacy manual token controls are retained only
+behind `DDB_LEGACY_RECOVERY=true` for preview troubleshooting, not silently run
+against GA. `fix-rebuild.bat` / `scripts/fix-rebuild-certs.ps1` are legacy manual
+tools, not routine GA setup steps.
 
-- **`pg` driver + connection pool to the CNPG `<cluster>-rw` service.** This is the recommended way for any app to talk to a CNPG cluster. The `-rw` service auto-routes to the current primary instance.
-- **Auth via the `<cluster>-app` Secret.** CNPG provisions a non-superuser `app` role for application data. Real apps mount that Secret as env vars (`PGHOST`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`) on the Pod.
-- **Cache "which cluster is primary" and invalidate on failover.** Asking the hub on every write is wasteful — checking once per minute (or eventing off the failover) is plenty.
-- **Sequenced primary-then-replica refresh** in the UI is the correct way to render reads after writes against an async-replica system. Otherwise the replica can render before the primary commits and look "wrong".
-- **Application owns its tables.** Run DDL as the `app` user (or transfer ownership) so `TRUNCATE ... RESTART IDENTITY` and other owner-required ops work. We retrofit ownership with `ALTER TABLE bookings OWNER TO app; ALTER SEQUENCE bookings_id_seq OWNER TO app;`.
+The topology's WAL SQL and its write probe are real database operations.
+Do not open the production server against live contexts merely to preview CSS.
 
-### Demo-only shortcuts (don't ship this)
+## Local regression checks
 
-- **`kubectl port-forward` from a laptop.** We tunnel through the K8s API server because the monitor-app runs outside both clusters (you don't want Postgres on a public LoadBalancer, and the presenter is on a hotel Wi-Fi). Each tunnel adds K8s-API hops and a single SPDY pipe — fine for one demo, wrong for production.
-- **`discoverClusterCreds()` runtime kubectl-secret reads.** A real app mounts the secret directly. We do it at runtime because the monitor-app needs credentials for both clusters and isn't deployed in either of them.
-
-### What a production deployment looks like
-
-```
-┌─────────────────────────┐
-│  App / API server       │  ← runs as a Deployment in one of the member clusters
-│  (in-cluster Pod)       │     (or in a peered VNet/VPC)
-│                         │
-│  Pool({                 │
-│    host: '<cluster>-rw  │
-│      .documentdb-preview│
-│      -ns.svc.cluster    │
-│      .local',           │
-│    port: 5432,          │
-│    user: env.PGUSER,    │  ← from <cluster>-app Secret mounted as env
-│    password: env.PGPASS,│
-│    database: 'app',     │
-│  })                     │
-└──────────┬──────────────┘
-           │ direct TCP, no port-forward, no kubectl
-           ▼
-┌──────────────────────────────────────────┐
-│ <cluster>-rw ClusterIP service (CNPG)    │
-│ → routes to current primary instance     │
-└──────────────────────────────────────────┘
+```powershell
+npm test --prefix app\monitor-app
 ```
 
-For multi-cloud "which cluster is primary right now", a real deployment uses one of:
-- **Global DNS** (Azure Traffic Manager / AWS Route 53) pointing at the active primary's external endpoint, flipped by the same automation that runs `kubectl documentdb promote`
-- **A small router service near the hub** that the app queries (essentially what this monitor-app's primary-context cache does, but as a real service with proper SLAs)
-
-If you ever want to turn this monitor-app into something customers could run, deleting `startPortForward()` / `discoverClusterCreds()` and replacing them with in-cluster service connections is roughly a 30-line change.
-
+These use Node's test runner, mocked promotion commands, an ephemeral local
+Express server and Bash's offline `--render` path. They do not authenticate,
+provision, promote or modify Azure/AWS/Kubernetes resources.
+Cloud replication, restart behavior, actual metrics and data migration still
+require an explicitly authorized integration rehearsal.

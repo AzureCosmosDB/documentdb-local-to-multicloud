@@ -12,12 +12,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-RESOURCE_GROUP="${RESOURCE_GROUP:-docdb-multicloud-rg}"
-AKS_CLUSTER_NAME="${AKS_CLUSTER_NAME:-azure-documentdb}"
-EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME:-aws-documentdb}"
-GKE_CLUSTER_NAME="${GKE_CLUSTER_NAME:-gcp-documentdb}"
-INCLUDE_GKE="${INCLUDE_GKE:-false}"
-HUB_CONTEXT="${HUB_CONTEXT:-hub}"
+PRIMARY_EXPLICIT="${PRIMARY_CLUSTER:+true}"
+source "$SCRIPT_DIR/config.sh"
+source "$SCRIPT_DIR/../versions.sh"
 DELETE_EXISTING="${DELETE_EXISTING:-false}"
 ENABLE_AZURE_DNS="${ENABLE_AZURE_DNS:-false}"
 
@@ -26,47 +23,66 @@ AZURE_DNS_PARENT_ZONE_RESOURCE_ID="${AZURE_DNS_PARENT_ZONE_RESOURCE_ID:-}"
 AZURE_DNS_ZONE_FULL_NAME="${AZURE_DNS_ZONE_FULL_NAME:-}"
 AZURE_DNS_ZONE_RG="${AZURE_DNS_ZONE_RG:-${RESOURCE_GROUP}}"
 
+RENDER_ONLY=false
+if [ "${1:-}" = "--render" ]; then RENDER_ONLY=true; shift; fi
 DOCUMENTDB_PASSWORD="${1:-${DOCUMENTDB_PASSWORD:-}}"
+if [ "$RENDER_ONLY" = false ] && kubectl --context "$HUB_CONTEXT" -n documentdb-preview-ns get secret documentdb-credentials >/dev/null 2>&1; then
+  DOCUMENTDB_PASSWORD=$(kubectl --context "$HUB_CONTEXT" -n documentdb-preview-ns get secret documentdb-credentials -o jsonpath='{.data.password}' | base64 -d)
+fi
 if [ -z "$DOCUMENTDB_PASSWORD" ]; then
-  echo "No password provided; generating one..."
+  if [ "$RENDER_ONLY" = true ]; then
+    echo "ERROR: set DOCUMENTDB_PASSWORD for offline rendering (use a dummy value)." >&2
+    exit 1
+  fi
+  echo "No password provided; generating one. Stored in the Kubernetes Secret."
   DOCUMENTDB_PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
-  echo "Generated password: $DOCUMENTDB_PASSWORD"
-  echo "(Save this - you'll need it for mongo client connections)"
-  echo ""
 fi
 export DOCUMENTDB_PASSWORD
 
-if [ "$INCLUDE_GKE" = "true" ]; then
-  CLUSTER_ARRAY=("$AKS_CLUSTER_NAME" "$EKS_CLUSTER_NAME" "$GKE_CLUSTER_NAME")
-else
-  CLUSTER_ARRAY=("$AKS_CLUSTER_NAME" "$EKS_CLUSTER_NAME")
-fi
-PRIMARY_CLUSTER="${PRIMARY_CLUSTER:-${CLUSTER_ARRAY[0]}}"
+CLUSTER_ARRAY=("${MEMBER_CLUSTER_NAMES[@]}")
 
+CLUSTER_LIST=""
+PLACEMENT_LIST=""
+for i in "${!CLUSTER_ARRAY[@]}"; do
+  CLUSTER_LIST+="      - name: ${CLUSTER_ARRAY[$i]}
+        environment: ${MEMBER_ENVIRONMENTS[$i]}
+"
+  if [ "${MEMBER_ENVIRONMENTS[$i]}" = eks ]; then
+    CLUSTER_LIST+="        storageClass: documentdb-storage
+"
+  fi
+  PLACEMENT_LIST+="      - ${CLUSTER_ARRAY[$i]}
+"
+done
+
+render_manifest() {
+  local line password_b64
+  password_b64=$(printf '%s' "$DOCUMENTDB_PASSWORD" | base64 | tr -d '\r\n')
+  while IFS= read -r line; do
+    line="${line//$'\r'/}"
+    case "$line" in
+      '{{CLUSTER_LIST}}') printf '%s' "$CLUSTER_LIST" ;;
+      '{{PLACEMENT_LIST}}') printf '%s' "$PLACEMENT_LIST" ;;
+      *)
+        line="${line//\{\{DOCUMENTDB_PASSWORD_BASE64\}\}/$password_b64}"
+        line="${line//\{\{PRIMARY_CLUSTER\}\}/$PRIMARY_CLUSTER}"
+        line="${line//\{\{DOCUMENTDB_VERSION\}\}/$DOCUMENTDB_VERSION}"
+        printf '%s\n' "$line"
+        ;;
+    esac
+  done < "$SCRIPT_DIR/documentdb-cluster.yaml"
+}
+if [ "$RENDER_ONLY" = true ]; then render_manifest; exit 0; fi
 echo "Member clusters (${#CLUSTER_ARRAY[@]}): ${CLUSTER_ARRAY[*]}"
 echo "Primary cluster: $PRIMARY_CLUSTER"
 echo "Hub context:     $HUB_CONTEXT"
-
-CLUSTER_LIST=$(cat <<EOF
-      - name: ${AKS_CLUSTER_NAME}
-        environment: aks
-      - name: ${EKS_CLUSTER_NAME}
-        environment: eks
-        storageClass: documentdb-storage
-EOF
-)
-if [ "$INCLUDE_GKE" = "true" ]; then
-  CLUSTER_LIST="$CLUSTER_LIST
-      - name: ${GKE_CLUSTER_NAME}
-        environment: gke"
-fi
 
 echo ""
 echo "=== Creating cluster-name ConfigMaps on members ==="
 for cluster in "${CLUSTER_ARRAY[@]}"; do
   if ! kubectl config get-contexts "$cluster" >/dev/null 2>&1; then
-    echo "  X context $cluster not found, skipping"
-    continue
+    echo "ERROR: context $cluster not found. Run deploy.sh first." >&2
+    exit 1
   fi
   kubectl --context "$cluster" create configmap cluster-name \
     -n kube-system --from-literal=name="$cluster" \
@@ -105,23 +121,34 @@ if [ -n "$EXISTING_RESOURCES" ]; then
         kubectl --context "$c" wait --for=delete namespace/documentdb-preview-ns --timeout=120s 2>/dev/null || true
       done
       ;;
-    2) echo "Updating in place..." ;;
+    2)
+      current=$(kubectl --context "$HUB_CONTEXT" -n documentdb-preview-ns get documentdb documentdb-preview -o json)
+      current_version=$(printf '%s' "$current" | jq -r '.spec.documentDBVersion // ""')
+      if [ "$current_version" != "$DOCUMENTDB_VERSION" ]; then
+        echo "ERROR: existing engine is '$current_version', requested '$DOCUMENTDB_VERSION'. Follow the upstream upgrade guide before using this script." >&2
+        exit 1
+      fi
+      existing_primary=$(printf '%s' "$current" | jq -r '.spec.clusterReplication.primary')
+      if [[ " ${CLUSTER_ARRAY[*]} " != *" $existing_primary "* ]]; then
+        echo "ERROR: the current primary is not an enabled member; promote another member before removing it." >&2
+        exit 1
+      fi
+      if [ "$PRIMARY_EXPLICIT" = true ] && [ "$PRIMARY_CLUSTER" != "$existing_primary" ]; then
+        echo "ERROR: use the promote workflow to change an existing primary, not a deployment update." >&2
+        exit 1
+      fi
+      PRIMARY_CLUSTER="$existing_primary"
+      echo "Updating in place; primary: $PRIMARY_CLUSTER"
+      ;;
     3) echo "Cancelled."; exit 0 ;;
     *) echo "Invalid choice."; exit 1 ;;
   esac
 fi
 
 TEMP_YAML=$(mktemp)
-sed -e "s/{{DOCUMENTDB_PASSWORD}}/$DOCUMENTDB_PASSWORD/g" \
-    -e "s/{{PRIMARY_CLUSTER}}/$PRIMARY_CLUSTER/g" \
-    "$SCRIPT_DIR/documentdb-cluster.yaml" | \
-while IFS= read -r line; do
-  if [[ "$line" == '{{CLUSTER_LIST}}' ]]; then
-    echo "$CLUSTER_LIST"
-  else
-    echo "$line"
-  fi
-done > "$TEMP_YAML"
+chmod 600 "$TEMP_YAML"
+trap 'rm -f "$TEMP_YAML"' EXIT
+render_manifest > "$TEMP_YAML"
 
 echo ""
 echo "=== Generated DocumentDB CR ==="
@@ -224,8 +251,8 @@ echo "============================================================"
 echo "DocumentDB CR applied."
 echo ""
 echo "Connection info:"
-echo "  Username: default_user"
-echo "  Password: $DOCUMENTDB_PASSWORD"
+echo "  Username: docdb"
+echo "  Password: stored in Secret documentdb-credentials (not printed)"
 echo ""
 echo "Next: load the demo dataset onto the primary (replicates to the"
 echo "replica cloud over WAL). From the repo root:"

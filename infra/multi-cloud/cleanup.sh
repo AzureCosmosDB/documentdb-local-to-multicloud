@@ -4,15 +4,10 @@
 
 set -euo pipefail
 
-RESOURCE_GROUP="${RESOURCE_GROUP:-docdb-multicloud-rg}"
-AKS_CLUSTER_NAME="${AKS_CLUSTER_NAME:-azure-documentdb}"
-EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME:-aws-documentdb}"
-EKS_REGION="${EKS_REGION:-us-west-2}"
-GKE_CLUSTER_NAME="${GKE_CLUSTER_NAME:-gcp-documentdb}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/config.sh"
 GCP_PROJECT_ID="${GCP_PROJECT_ID:-${PROJECT_ID:-}}"
 GCP_ZONE="${GCP_ZONE:-${ZONE:-us-central1-a}}"
-INCLUDE_GKE="${INCLUDE_GKE:-false}"
-HUB_CONTEXT="${HUB_CONTEXT:-hub}"
 
 YES=false
 WAIT=false
@@ -25,7 +20,9 @@ done
 
 echo "Multi-cloud cleanup target:"
 echo "  Azure RG:   $RESOURCE_GROUP"
-echo "  EKS:        $EKS_CLUSTER_NAME (region $EKS_REGION)"
+echo "  Members:    ${MEMBER_CLUSTER_NAMES[*]}"
+[ "$INCLUDE_EKS" = true ] && echo "  EKS:        $EKS_CLUSTER_NAME (region $EKS_REGION)"
+echo "  The entire Azure RG will be deleted, including both AKS members if enabled."
 [ "$INCLUDE_GKE" = "true" ] && echo "  GKE:        $GKE_CLUSTER_NAME (project $GCP_PROJECT_ID, zone $GCP_ZONE)"
 
 if [ "$YES" != "true" ]; then
@@ -39,12 +36,14 @@ if kubectl config get-contexts "$HUB_CONTEXT" >/dev/null 2>&1; then
   kubectl --context "$HUB_CONTEXT" delete namespace documentdb-preview-ns --ignore-not-found=true --wait=false || true
 fi
 
+if [ "$INCLUDE_EKS" = true ]; then
 if eksctl get cluster --name "$EKS_CLUSTER_NAME" --region "$EKS_REGION" >/dev/null 2>&1; then
   echo "[eks] Deleting cluster $EKS_CLUSTER_NAME (10-15 min)..."
   if [ "$WAIT" = "true" ]; then
     eksctl delete cluster --name "$EKS_CLUSTER_NAME" --region "$EKS_REGION" --wait
   else
     eksctl delete cluster --name "$EKS_CLUSTER_NAME" --region "$EKS_REGION" --disable-nodegroup-eviction &
+  fi
   fi
 else
   echo "[eks] $EKS_CLUSTER_NAME not present, skipping"
@@ -69,7 +68,7 @@ if [ "$INCLUDE_GKE" = "true" ]; then
 fi
 
 echo "[local] Removing kubectl contexts..."
-for ctx in "$HUB_CONTEXT" "$AKS_CLUSTER_NAME" "$EKS_CLUSTER_NAME" "$GKE_CLUSTER_NAME"; do
+for ctx in "$HUB_CONTEXT" "${MEMBER_CLUSTER_NAMES[@]}"; do
   kubectl config delete-context "$ctx" >/dev/null 2>&1 || true
   kubectl config delete-cluster "$ctx" >/dev/null 2>&1 || true
   kubectl config delete-user    "$ctx" >/dev/null 2>&1 || true
@@ -82,4 +81,4 @@ fi
 echo ""
 echo "Cleanup initiated. Verify:"
 echo "   az group exists --name $RESOURCE_GROUP"
-echo "   aws eks list-clusters --region $EKS_REGION"
+if [ "$INCLUDE_EKS" = true ]; then echo "   aws eks list-clusters --region $EKS_REGION"; fi
