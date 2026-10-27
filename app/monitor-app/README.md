@@ -7,6 +7,42 @@ rows, and a navy infrastructure console with teal accents and cluster panels.
 Both themes cover all four tabs, including responsive layouts and keyboard focus.
 The controls and demo workflow are unchanged.
 
+## Screenshots
+
+These captures show the implemented **dark theme** with sample cluster, booking,
+search, and workload data. They illustrate the UI, not live infrastructure health,
+measured database performance, or a completed cloud failover. The header's theme
+toggle also provides the light developer-console theme.
+
+### Topology
+
+Inspect each member's role, pods, service endpoint, and WAL replication lag.
+The regional AKS replica and AWS replica keep separate identities and reuse the
+existing **Promote to primary** and **Rebuild replica** controls.
+
+![Dark-theme Topology tab with a primary and two distinct replica targets](../../docs/images/monitor/dark-topology.png)
+
+### Bookings
+
+Add bookings on the current primary and watch them appear on each replica.
+The existing batch, undo, seed, and reset controls remain available.
+
+![Dark-theme Bookings tab displaying matching sample bookings on the AKS primary, regional AKS replica, and AWS replica](../../docs/images/monitor/dark-bookings.png)
+
+### Vector Search
+
+Search the local listings dataset using a natural-language query, inspect ranked
+results and timings, and expand the pipeline used by the server.
+
+![Dark-theme Vector Search tab showing a cabin query, sample ranked results, scores, prices, and search timings](../../docs/images/monitor/dark-vector-search.png)
+
+### Load
+
+Choose a target request rate or preset, adjust the operation mix, and observe
+throughput, latency, and per-operation totals against the current primary.
+
+![Dark-theme Load tab showing the request-rate slider, workload mix, sample latency metrics, and operation totals](../../docs/images/monitor/dark-load.png)
+
 ## Run
 
 Use Node.js 24 LTS, kubectl and the operator 1.0.0 `kubectl documentdb` plugin.

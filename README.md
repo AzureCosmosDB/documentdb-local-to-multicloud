@@ -101,6 +101,17 @@ The UI has four tabs:
 | **Vector Search** | `$vectorSearch` queries over `bookingsdb.listings` against the **local Docker** instance, using the HNSW index. Try queries like *"cozy mountain cabin with hot tub"*. |
 | **Load** | A travel-booking workload generator: 80% browse / 15% detail / 4% insert / 1% confirm against the current primary. RPS slider with presets (idle / morning / peak / Black Friday) and an in-flight semaphore to keep client and server pools healthy. |
 
+### Monitor preview
+
+The dark-theme topology shows separate regional AKS members alongside the optional
+AWS member, with the same promotion and recovery controls on each eligible target.
+
+![Dark-theme Topology tab showing an AKS primary, a second regional AKS member, and an AWS replica](docs/images/monitor/dark-topology.png)
+
+The screenshots use **sample data**, not live infrastructure status or benchmark
+results. See the [full screenshot gallery](app/monitor-app/README.md#screenshots)
+for **Bookings**, **Vector Search**, and **Load**.
+
 First-time setup of the monitor:
 
 ```powershell
