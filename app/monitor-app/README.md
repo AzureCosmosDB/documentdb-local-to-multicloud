@@ -1,8 +1,11 @@
 # DocumentDB Multi-Cloud Monitor
 
 The existing Topology, Bookings, Vector Search and Load tabs work with AKS + EKS,
-two regional AKS members, or all three. The visual refresh changes CSS, spacing,
-contrast, focus states and responsive layout, not the demo workflow.
+two regional AKS members, or all three. The header's existing theme toggle switches
+between a white/slate developer console with blue accents and horizontal topology
+rows, and a navy infrastructure console with teal accents and cluster panels.
+Both themes cover all four tabs, including responsive layouts and keyboard focus.
+The controls and demo workflow are unchanged.
 
 ## Run
 
