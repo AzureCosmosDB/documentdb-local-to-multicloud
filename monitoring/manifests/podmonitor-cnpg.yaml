@@ -28,7 +28,7 @@ spec:
           targetLabel: instance_name
         - action: replace
           sourceLabels: [__meta_kubernetes_pod_label_cnpg_io_instanceRole]
-          targetLabel: instance_role
+          targetLabel: pg_target
         # Stamp every series with the cloud (set per-cluster via external label on the Prometheus).
         - action: replace
           sourceLabels: [__meta_kubernetes_pod_node_name]

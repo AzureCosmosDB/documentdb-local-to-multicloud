@@ -8,15 +8,34 @@ metadata:
 
 ---
 
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: cnpg-metrics-permissive
+  namespace: documentdb-preview-ns
+spec:
+  selector:
+    matchLabels:
+      cnpg.io/podRole: instance
+  mtls:
+    mode: STRICT
+  portLevelMtls:
+    "9187":
+      mode: PERMISSIVE
+    "8000":
+      mode: PERMISSIVE
+
+---
+
 apiVersion: v1
 kind: Secret
 metadata:
   name: documentdb-credentials
   namespace: documentdb-preview-ns
 type: Opaque
-stringData:
-  username: docdb
-  password: {{DOCUMENTDB_PASSWORD}}
+data:
+  username: ZG9jZGI=
+  password: {{DOCUMENTDB_PASSWORD_BASE64}}
 
 ---
 
@@ -26,12 +45,16 @@ metadata:
   name: documentdb-preview
   namespace: documentdb-preview-ns
 spec:
+  documentDBVersion: "{{DOCUMENTDB_VERSION}}"
+  documentDbCredentialSecret: documentdb-credentials
   nodeCount: 1
   instancesPerNode: 1
   resource:
     storage:
       pvcSize: 10Gi
   clusterReplication:
+    # PostgreSQL replication travels inside the Istio mTLS boundary.
+    disableTLS: true
     highAvailability: true
     primary: {{PRIMARY_CLUSTER}}
     crossCloudNetworkingStrategy: Istio
@@ -54,6 +77,8 @@ spec:
       kind: Namespace
       name: documentdb-preview-ns
   policy:
-    placementType: PickAll
+    placementType: PickFixed
+    clusterNames:
+{{PLACEMENT_LIST}}
   strategy:
     type: RollingUpdate

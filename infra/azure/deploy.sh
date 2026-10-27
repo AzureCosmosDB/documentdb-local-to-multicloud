@@ -25,7 +25,7 @@ if [[ "$(uname -s)" == *MINGW* ]] || [[ "$(uname -s)" == *MSYS* ]] || [[ "$(unam
 fi
 
 # Verify required tools (check both 'cmd' and 'cmd.exe' for WSL compatibility)
-for cmd in az kubectl helm; do
+for cmd in az kubectl helm jq; do
   if ! command -v "$cmd" &>/dev/null && ! command -v "${cmd}.exe" &>/dev/null; then
     echo "ERROR: Required tool not found: $cmd"
     echo "   Install it and ensure it is on your PATH."
@@ -36,7 +36,7 @@ done
 echo "All required tools found."
 
 # WSL shim: if 'helm' isn't found but 'helm.exe' is, create aliases
-for cmd in az kubectl helm mongosh; do
+for cmd in az kubectl helm jq mongosh; do
   if ! command -v "$cmd" &>/dev/null && command -v "${cmd}.exe" &>/dev/null; then
     eval "function $cmd() { ${cmd}.exe \"\$@\"; }"
     export -f "$cmd" 2>/dev/null || true
@@ -44,6 +44,7 @@ for cmd in az kubectl helm mongosh; do
 done
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$REPO_ROOT/infra/versions.sh"
 RESOURCE_GROUP="${RESOURCE_GROUP:-docdb-demo-rg}"
 LOCATION="${LOCATION:-eastus2}"
 CLUSTER_NAME="${CLUSTER_NAME:-docdb-demo-aks}"
@@ -66,6 +67,7 @@ az deployment group create \
   --template-file "$(dirname "$0")/main.bicep" \
   --parameters "$(dirname "$0")/main.bicepparam" \
   --parameters clusterName="$CLUSTER_NAME" location="$LOCATION" ownerEmail="$OWNER_EMAIL" \
+  --parameters kubernetesVersion="$KUBERNETES_VERSION" \
   --output none
 
 # Get credentials
@@ -74,17 +76,7 @@ az aks get-credentials --resource-group "$RESOURCE_GROUP" --name "$CLUSTER_NAME"
 echo ""
 echo "=== Installing DocumentDB operator ==="
 
-# Install cert-manager (idempotent via apply)
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
-echo "Waiting for cert-manager..."
-kubectl wait --for=condition=available --timeout=180s deployment/cert-manager -n cert-manager
-kubectl wait --for=condition=available --timeout=180s deployment/cert-manager-webhook -n cert-manager
-
-# Install DocumentDB operator via Helm (idempotent via upgrade --install)
-helm repo add documentdb https://documentdb.github.io/documentdb-kubernetes-operator 2>/dev/null || true
-helm repo update
-helm upgrade --install documentdb-operator documentdb/documentdb-operator \
-  --namespace documentdb-operator --create-namespace
+install_documentdb_operator aks-demo
 
 echo "Waiting for operator..."
 kubectl wait --for=condition=available --timeout=180s deployment/documentdb-operator -n documentdb-operator
@@ -113,6 +105,7 @@ metadata:
   name: docdb-demo
   namespace: documentdb-ns
 spec:
+  documentDBVersion: "$DOCUMENTDB_VERSION"
   environment: aks
   nodeCount: 1
   instancesPerNode: 1

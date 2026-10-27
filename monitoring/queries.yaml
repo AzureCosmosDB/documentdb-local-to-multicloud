@@ -1,0 +1,58 @@
+# CNPG chart default queries. Metric names gain the cnpg_ prefix.
+pg_wal_position:
+  query: |
+    SELECT CASE WHEN pg_is_in_recovery()
+      THEN pg_wal_lsn_diff(pg_last_wal_replay_lsn(), '0/0')
+      ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')
+    END AS lsn_bytes, CASE WHEN pg_is_in_recovery() THEN 1 ELSE 0 END AS in_recovery
+  metrics:
+    - lsn_bytes: {usage: GAUGE, description: "Current or replayed WAL position"}
+    - in_recovery: {usage: GAUGE, description: "1 on a standby, 0 on a primary"}
+pg_stat_replication:
+  primary: true
+  query: |
+    SELECT application_name, state, sync_state,
+      COALESCE(EXTRACT(EPOCH FROM write_lag), 0) AS write_lag_seconds,
+      COALESCE(EXTRACT(EPOCH FROM flush_lag), 0) AS flush_lag_seconds,
+      COALESCE(EXTRACT(EPOCH FROM replay_lag), 0) AS replay_lag_seconds,
+      COALESCE(pg_wal_lsn_diff(sent_lsn, replay_lsn), 0) AS replay_bytes_behind
+    FROM pg_catalog.pg_stat_replication
+  metrics:
+    - application_name: {usage: LABEL, description: "Replica identity"}
+    - state: {usage: LABEL, description: "Replication state"}
+    - sync_state: {usage: LABEL, description: "Synchronization state"}
+    - write_lag_seconds: {usage: GAUGE, description: "Write lag"}
+    - flush_lag_seconds: {usage: GAUGE, description: "Flush lag"}
+    - replay_lag_seconds: {usage: GAUGE, description: "Replay lag"}
+    - replay_bytes_behind: {usage: GAUGE, description: "Bytes not replayed"}
+pg_stat_wal_receiver:
+  query: |
+    SELECT status, COALESCE(pg_wal_lsn_diff(latest_end_lsn, '0/0'), 0) AS latest_end_lsn_bytes
+    FROM pg_catalog.pg_stat_wal_receiver
+  metrics:
+    - status: {usage: LABEL, description: "WAL receiver state"}
+    - latest_end_lsn_bytes: {usage: GAUGE, description: "Received WAL position"}
+pg_database_stats:
+  query: |
+    SELECT datname, numbackends, xact_commit, xact_rollback,
+      tup_inserted, tup_updated, tup_deleted, tup_returned,
+      pg_database_size(datname) AS size_bytes
+    FROM pg_catalog.pg_stat_database
+    WHERE datname IS NOT NULL AND datname NOT LIKE 'template%'
+  metrics:
+    - datname: {usage: LABEL, description: "Database"}
+    - numbackends: {usage: GAUGE, description: "Active backends"}
+    - xact_commit: {usage: COUNTER, description: "Commits"}
+    - xact_rollback: {usage: COUNTER, description: "Rollbacks"}
+    - tup_inserted: {usage: COUNTER, description: "Inserted tuples"}
+    - tup_updated: {usage: COUNTER, description: "Updated tuples"}
+    - tup_deleted: {usage: COUNTER, description: "Deleted tuples"}
+    - tup_returned: {usage: COUNTER, description: "Returned tuples"}
+    - size_bytes: {usage: GAUGE, description: "Database size"}
+pg_activity_states:
+  query: |
+    SELECT COALESCE(state, 'unknown') AS state, COUNT(*) AS connections
+    FROM pg_catalog.pg_stat_activity GROUP BY state
+  metrics:
+    - state: {usage: LABEL, description: "Backend state"}
+    - connections: {usage: GAUGE, description: "Connections"}

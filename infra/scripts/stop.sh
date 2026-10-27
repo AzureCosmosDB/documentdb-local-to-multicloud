@@ -22,33 +22,24 @@ read -rp "Selection [1-3]: " choice
 case $choice in
   1)
     echo "=== Stopping local DocumentDB ==="
-    docker stop docdb 2>/dev/null && echo "✅ Container stopped" || echo "Container not running"
+    docker compose -f "$REPO_ROOT/docker-compose.yml" stop documentdb
     ;;
   2)
-    echo "⚠️  This deletes the entire multi-cloud stack:"
-    echo "   - Azure RG (Fleet hub + AKS member + DNS zones)"
-    echo "   - EKS cluster + all CloudFormation stacks"
-    echo "   - All DocumentDB data on both clouds"
-    echo ""
-    read -rp "Type 'destroy' to confirm: " confirm
-    if [[ "$confirm" == "destroy" ]]; then
-      bash "$REPO_ROOT/infra/multi-cloud/cleanup.sh" -y --wait
-      echo "✅ Multi-cloud stack destroyed."
-      echo "   Redeploy with: bash infra/multi-cloud/deploy.sh"
-    else
-      echo "Cancelled."
-    fi
+    # The shared cleanup script prints the configured members and asks for confirmation.
+    bash "$REPO_ROOT/infra/multi-cloud/cleanup.sh" --wait
     ;;
   3)
+    source "$REPO_ROOT/infra/multi-cloud/config.sh"
     echo "=== Local ==="
     docker ps --filter name=docdb --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
     echo ""
     echo "=== Azure ==="
-    az group exists --name docdb-multicloud-rg 2>/dev/null && \
-      echo "RG docdb-multicloud-rg: exists" || echo "RG docdb-multicloud-rg: gone"
+    az group exists --name "$RESOURCE_GROUP"
     echo ""
-    echo "=== AWS (us-west-2) ==="
-    aws eks list-clusters --region us-west-2 --output text 2>/dev/null || echo "(aws not configured)"
+    if [ "$INCLUDE_EKS" = true ]; then
+      echo "=== AWS ($EKS_REGION) ==="
+      aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$EKS_REGION" --query cluster.status --output text
+    fi
     ;;
   *)
     echo "Invalid selection"

@@ -19,7 +19,9 @@
 [CmdletBinding()]
 param(
     [switch]$NoBrowser,
-    [switch]$NoGrafana
+    [switch]$NoGrafana,
+    [string[]]$MemberContexts,
+    [string]$HubContext
 )
 
 $ErrorActionPreference = "Stop"

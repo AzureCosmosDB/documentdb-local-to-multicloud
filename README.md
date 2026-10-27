@@ -10,7 +10,7 @@ Build, test, and scale across clouds with DocumentDB.
 
 - Spin up DocumentDB locally with Docker Compose in under 60 seconds
 - Run semantic vector search on a real listings dataset (HNSW, 1536-dim, cosine)
-- Deploy DocumentDB across **AKS + EKS** with cross-cloud WAL replication over an Istio mesh
+- Deploy DocumentDB across **AKS + EKS**, **two regional AKS clusters**, or all three, with WAL replication over an Istio mesh
 - Drive a realistic travel-booking workload through a live web app
 - Trigger a one-click cross-cloud failover and watch writes flip in real time
 - Observe everything through Grafana dashboards on both clusters
@@ -28,6 +28,10 @@ Docker Compose starts the `documentdb-local` container and auto-seeds the
 `descriptionVector` fields) plus the vector + supporting indexes. Default
 credentials: `demo` / `demo` on `localhost:27017`.
 
+The local image is pinned to DocumentDB 1.0 / PostgreSQL 18. The listings/vector
+demo requires `data/listings_vectors.json`, an ignored local dataset that is not
+included in a fresh checkout. Supply that dataset before starting the seed job.
+
 Connect with mongosh:
 
 ```bash
@@ -43,10 +47,13 @@ and point it at the same connection string.
 - [Docker Desktop](https://www.docker.com/) — local stack
 - [Visual Studio Code](https://code.visualstudio.com/) + [DocumentDB for VS Code](https://marketplace.visualstudio.com/items?itemName=ms-azuretools.vscode-documentdb)
 - [mongosh](https://www.mongodb.com/try/download/shell) — optional shell access
-- [Node.js 20+](https://nodejs.org/) — for the monitor web app
+- [Node.js 24 LTS](https://nodejs.org/) — for the monitor web app
 - For the multi-cloud demo: Azure CLI, AWS CLI, `eksctl`, `kubectl`, `helm`, and a bash-capable shell (Git Bash on Windows)
 
 See [SETUP.md](SETUP.md) for the full tooling matrix and cloud-account requirements.
+Operator 1.0.0 requires ImageVolume-capable Kubernetes; the scripts default to
+1.35. Existing preview deployments need a deliberate migration, not an unattended
+chart upgrade. AWS tools/accounts are not needed for the Azure-only option.
 
 ## Repository structure
 
@@ -89,16 +96,27 @@ The UI has four tabs:
 
 | Tab | What it does |
 | --- | --- |
-| **Topology** | Live status of every cluster + per-replica WAL lag from `pg_stat_replication`. **Promote to primary** button triggers a one-click cross-cloud failover via `kubectl documentdb promote`. **Rebuild replica** wipes the replica's PVCs and rebuilds via `pg_basebackup` — with a background watcher that auto-recovers from a known cert-mismatch bug in the operator. |
+| **Topology** | Live status of every member + per-replica WAL lag from `pg_stat_replication`. **Promote to primary** runs the operator's planned switchover after all members pass health checks. **Rebuild replica** wipes the selected replica's PVCs and rebuilds via `pg_basebackup`. Old preview-only certificate recovery is opt-in, not enabled on GA. |
 | **Bookings** | Direct Mongo reads/writes against the **current primary** for `bookingsdb.bookings`. Each insert is followed by a wait-for-replication check so you can see the row appear on the replica with a measured lag. |
 | **Vector Search** | `$vectorSearch` queries over `bookingsdb.listings` against the **local Docker** instance, using the HNSW index. Try queries like *"cozy mountain cabin with hot tub"*. |
 | **Load** | A travel-booking workload generator: 80% browse / 15% detail / 4% insert / 1% confirm against the current primary. RPS slider with presets (idle / morning / peak / Black Friday) and an in-flight semaphore to keep client and server pools healthy. |
+
+### Monitor preview
+
+The dark-theme topology shows separate regional AKS members alongside the optional
+AWS member, with the same promotion and recovery controls on each eligible target.
+
+![Dark-theme Topology tab showing an AKS primary, a second regional AKS member, and an AWS replica](docs/images/monitor/dark-topology.png)
+
+The screenshots use **sample data**, not live infrastructure status or benchmark
+results. See the [full screenshot gallery](app/monitor-app/README.md#screenshots)
+for **Bookings**, **Vector Search**, and **Load**.
 
 First-time setup of the monitor:
 
 ```powershell
 cd app\monitor-app
-npm install
+npm ci
 ```
 
 ## Multi-cloud deployment
@@ -139,6 +157,21 @@ bash infra/multi-cloud/cleanup.sh -y --wait
 See [`infra/multi-cloud/README.md`](infra/multi-cloud/README.md) for env-var
 configuration (`INCLUDE_GKE=true` for a third leg, `PRIMARY_CLUSTER=...` to
 start with EKS as primary, etc.).
+
+For **Azure-only regional failover**, export `INCLUDE_EKS=false`,
+`INCLUDE_AKS_REPLICA=true`, and `AKS_REPLICA_REGION=<second-region>` before the
+same deployment commands. Keep those settings for monitoring and cleanup.
+Leave `INCLUDE_EKS=true` to retain AWS alongside the second AKS member.
+Run `bash monitoring/deploy.sh` to install monitoring on all enabled members.
+Launch the Azure-only monitor with:
+
+```powershell
+.\start.ps1 -MemberContexts azure-documentdb,azure-documentdb-secondary
+```
+
+These are planned switchovers, not a guarantee of zero data loss or an automatic
+disaster-recovery procedure. Region availability, mesh connectivity and real
+database failover must be rehearsed on explicitly authorized cloud resources.
 
 The standalone single-cluster deploys are still in `infra/azure/` and
 `infra/aws/` for anyone who wants the simpler "one cloud at a time" demo, but

@@ -7,12 +7,26 @@ on:
     branches: [main]
 
 jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: app/monitor-app/package-lock.json
+      - run: npm ci --prefix app/monitor-app --ignore-scripts
+      - run: npm test --prefix app/monitor-app
+      - name: Check shell syntax
+        run: find infra monitoring -name '*.sh' -print0 | xargs -0 -n1 bash -n
+
   test:
     runs-on: ubuntu-latest
 
     services:
       documentdb:
-        image: ghcr.io/documentdb/documentdb/documentdb-local:latest
+        image: ghcr.io/documentdb/documentdb/documentdb-local:pg18-1.0.0@sha256:03aef53ed72cd3007236f8ce1b4ef7a0c958dbbce1519074b85d8a3e10be89a5
         ports:
           - 10260:10260
         options: >-
@@ -28,13 +42,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
       - name: Install dependencies
         run: |
-          pip install pymongo python-dotenv
+          pip install -r requirements.txt
 
       - name: Wait for DocumentDB
         run: |

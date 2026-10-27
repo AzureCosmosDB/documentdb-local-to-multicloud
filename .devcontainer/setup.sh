@@ -9,9 +9,10 @@ pip install pymongo python-dotenv openai langchain fastapi uvicorn
 
 # Pull and start DocumentDB local
 echo "Starting DocumentDB local..."
-docker pull ghcr.io/documentdb/documentdb/documentdb-local:latest
+LOCAL_IMAGE="ghcr.io/documentdb/documentdb/documentdb-local:pg18-1.0.0@sha256:03aef53ed72cd3007236f8ce1b4ef7a0c958dbbce1519074b85d8a3e10be89a5"
+docker pull "$LOCAL_IMAGE"
 docker run -dt -p 10260:10260 --name docdb \
-  ghcr.io/documentdb/documentdb/documentdb-local:latest \
+  "$LOCAL_IMAGE" \
   --username demo --password test
 
 # Wait for DocumentDB to be ready

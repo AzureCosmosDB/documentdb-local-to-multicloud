@@ -1,6 +1,6 @@
 services:
   documentdb:
-    image: ghcr.io/documentdb/documentdb/documentdb-local:latest
+    image: ghcr.io/documentdb/documentdb/documentdb-local:pg18-1.0.0@sha256:03aef53ed72cd3007236f8ce1b4ef7a0c958dbbce1519074b85d8a3e10be89a5
     container_name: documentdb-local
     environment:
       USERNAME: demo

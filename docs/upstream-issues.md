@@ -3,6 +3,13 @@
 Captured during multi-cloud DocumentDB demo build (Techorama 2026 prep).
 File these as issues / PRs against the relevant upstream repos when convenient.
 
+> These are historical preview-build observations, not current GA setup
+> instructions. Operator 1.0.0 declares its Kubernetes/ImageVolume prerequisites
+> and clears stale promotion tokens in its replication reconciler. The demo now
+> installs published Istio Helm charts instead of the removed IstioOperator
+> deployment path. Certificate-rebuild recovery is not verified necessary on GA
+> and is disabled by default; see [the monitor guide](../app/monitor-app/README.md).
+
 ---
 
 ## 1. kubefleet — Symlinks in helm chart break Windows checkouts

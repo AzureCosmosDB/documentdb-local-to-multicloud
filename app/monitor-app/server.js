@@ -27,7 +27,8 @@ const { spawn } = require("child_process");
 const path = require("path");
 const { MongoClient } = require("mongodb");
 const { LoadGen, MAX_RPS } = require("./loadgen");
-try { require("dotenv").config({ path: path.join(__dirname, "..", "..", ".env") }); } catch (_) {}
+const { membersFromDocument, selectCNPGCluster, clusterStatus, checkReplication, createPromotionHandler } = require("./topology");
+require("dotenv").config({ path: path.join(__dirname, "..", "..", ".env"), quiet: true });
 
 function required(name) {
   const v = process.env[name];
@@ -47,14 +48,25 @@ const BOOKINGS_COLL = "bookings";
 const GATEWAY_PORT = 10260;
 const GATEWAY_SVC = `documentdb-service-${RESOURCE}`;
 const CREDENTIALS_SECRET = "documentdb-credentials";
+const LEGACY_RECOVERY = process.env.DDB_LEGACY_RECOVERY === "true";
 
 const MEMBER_CONTEXTS = required("DDB_MEMBER_CONTEXTS")
   .split(",").map((s) => s.trim()).filter(Boolean);
 if (MEMBER_CONTEXTS.length === 0) { console.error("DDB_MEMBER_CONTEXTS empty"); process.exit(1); }
+if (new Set(MEMBER_CONTEXTS).size !== MEMBER_CONTEXTS.length) throw new Error("DDB_MEMBER_CONTEXTS contains duplicate member identities");
 
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
+let topologyOperation = false;
+function withTopologyLock(handler) {
+  return async (req, res) => {
+    if (topologyOperation) return res.status(409).json({ ok: false, error: "Another topology operation is in progress" });
+    topologyOperation = true;
+    try { return await handler(req, res); }
+    finally { topologyOperation = false; }
+  };
+}
 
 function run(cmd, args, { timeoutMs = 60_000 } = {}) {
   return new Promise((resolve) => {
@@ -84,18 +96,10 @@ async function findCNPGCluster(ctx) {
     "--context", ctx, "-n", NAMESPACE,
     "get", "cluster.postgresql.cnpg.io", "-o", "json",
   ]);
-  if (res.code !== 0) return null;
+  if (res.code !== 0) throw new Error(`get CNPG on ${ctx}: ${res.stderr}`);
   const j = JSON.parse(res.stdout);
   if (!j.items || j.items.length === 0) return null;
-  // Prefer the cluster that actually has a -rw service
-  for (const c of j.items) {
-    const svc = await kubectl([
-      "--context", ctx, "-n", NAMESPACE,
-      "get", "svc", `${c.metadata.name}-rw`, "--ignore-not-found", "-o", "name",
-    ]);
-    if (svc.code === 0 && (svc.stdout || "").trim()) return c;
-  }
-  return j.items[0];
+  return selectCNPGCluster(j.items, RESOURCE);
 }
 
 // ---------- Status / failover endpoints (unchanged shape) ----------
@@ -115,13 +119,13 @@ async function getServiceLBHost(ctx) {
 app.get("/api/status", async (_req, res) => {
   try {
     const ddb = await getDocumentDB();
-    const primary = ddb.spec?.clusterReplication?.primary || null;
-    const replicas = ddb.spec?.clusterReplication?.replicas || [];
+    const { primary, replicas, members } = membersFromDocument(ddb, MEMBER_CONTEXTS);
+    _primaryCtxCache = { value: primary, expiresAt: Date.now() + 2000 };
     const crossCloudNetworkingStrategy =
       ddb.spec?.clusterReplication?.crossCloudNetworkingStrategy ||
       ddb.spec?.crossCloudNetworkingStrategy || null;
 
-    const clusters = await Promise.all(MEMBER_CONTEXTS.map(async (ctx) => {
+    const clusters = await Promise.all(members.map(async (ctx) => {
       const [c, lbHost] = await Promise.all([
         findCNPGCluster(ctx),
         getServiceLBHost(ctx),
@@ -130,7 +134,7 @@ app.get("/api/status", async (_req, res) => {
       const phaseReason = c?.status?.phaseReason || null;
       const ready = c?.status?.readyInstances ?? null;
       const instances = c?.status?.instances ?? null;
-      const healthy = !!(phase && /healthy/i.test(phase) && ready != null && instances != null && ready === instances);
+      const healthy = phase === "Cluster in healthy state" && ready > 0 && ready === instances;
       const isPrimary = ctx === primary;
       return {
         context: ctx,
@@ -146,6 +150,7 @@ app.get("/api/status", async (_req, res) => {
         healthy,
         role: isPrimary ? "PRIMARY" : "REPLICA",
         replicaSource: c?.spec?.replica?.source || null,
+        replicaPrimary: c?.spec?.replica?.primary || null,
         promotionToken: !!c?.spec?.replica?.promotionToken,
         inRecovery: c?.status?.currentPrimary == null,
         lbHost,
@@ -158,6 +163,23 @@ app.get("/api/status", async (_req, res) => {
     // settled (the preview operator's failover is not robust against
     // rapid back-to-back promotions and produces split-brain divergence).
     const replicationHealthy = await checkReplicationHealthy(clusters);
+    const primaryCluster = clusters.find((cluster) => cluster.role === "PRIMARY");
+    if (primaryCluster?.currentPrimary) {
+      const lag = await kubectl([
+        "--context", primary, "-n", NAMESPACE, "exec", primaryCluster.currentPrimary, "-c", "postgres", "--",
+        "psql", "-U", "postgres", "-tA", "-F", "|", "-c",
+        "select application_name, write_lag, flush_lag, replay_lag from pg_stat_replication",
+      ], { timeoutMs: 8000 });
+      if (lag.code === 0) {
+        primaryCluster.replication = lag.stdout.trim().split("\n").filter((line) => line.includes("|")).map((line) => {
+          const [app, writeLag, flushLag, replayLag] = line.split("|");
+          return { app, writeLag, flushLag, replayLag };
+        });
+      } else {
+        primaryCluster.replicationError = lag.stderr.trim();
+        console.warn(`[replication:${primary}] ${lag.stderr.trim()}`);
+      }
+    }
 
     // Write probe: actually attempt a tiny upsert against the current
     // primary's MongoDB-compatible gateway. This is the ground truth for
@@ -178,6 +200,7 @@ app.get("/api/status", async (_req, res) => {
       members: clusters,
       replicationHealthy,
       writeProbe,
+      legacyRecovery: LEGACY_RECOVERY,
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err.message || err) });
@@ -192,24 +215,11 @@ app.get("/api/status", async (_req, res) => {
 //   * The replica's pg_stat_wal_receiver shows status="streaming"
 //   * No timeline-mismatch FATALs in the last minute
 //
-// The pg_stat_wal_receiver probe shells into a pod via kubectl exec which
-// can take 5-15s, so we cache the result for 10s. Auto-refresh in the UI
-// runs every 5s and we don't need real-time accuracy here.
-let _replHealthCache = { value: null, expiresAt: 0, key: null };
-const REPL_HEALTH_TTL_MS = 10_000;
+// Probe every replica on its current leader, never an assumed "-1" pod.
 
 async function checkReplicationHealthy(clusters) {
-  try {
-    const primary = clusters.find((c) => c.role === "PRIMARY");
-    const replica = clusters.find((c) => c.role === "REPLICA");
-    if (!primary || !replica) return { ok: false, reason: "missing primary or replica cluster" };
-    if (!primary.healthy) return { ok: false, reason: `primary ${primary.context} is ${primary.phase}` };
-    if (!replica.healthy) return { ok: false, reason: `replica ${replica.context} is ${replica.phase}` };
-    if (primary.promotionToken) return { ok: false, reason: `primary ${primary.context} still has stale promotionToken` };
-    if (replica.promotionToken) return { ok: false, reason: `replica ${replica.context} still has stale promotionToken` };
-    if (!primary.currentPrimary) return { ok: false, reason: "primary has no currentPrimary pod yet" };
-
-    const podName = `${replica.cnpgName}-1`;
+  return checkReplication(clusters, async (replica) => {
+    const podName = replica.currentPrimary;
     const out = await kubectl([
       "--context", replica.context, "-n", NAMESPACE,
       "exec", podName, "-c", "postgres", "--",
@@ -228,9 +238,7 @@ async function checkReplicationHealthy(clusters) {
       return { ok: false, reason: `replica WAL receiver status="${status}" (expected "streaming")` };
     }
     return { ok: true };
-  } catch (err) {
-    return { ok: false, reason: `health probe error: ${err.message || err}` };
-  }
+  });
 }
 
 // Write probe: idempotent upsert against the primary's MongoDB-compatible
@@ -289,127 +297,24 @@ async function checkWriteProbe(primaryCtx) {
   return value;
 }
 
-// Reconciles the new primary CNPG cluster after a failover:
-//   1. Removes any stale promotionToken left by the operator.
-//   2. Forces synchronous-commit settings to a fast-write profile
-//      (preferred, ANY 1, no cross-cloud peer in standbyNamesPre).
-// The DocumentDB operator regenerates these on every promotion, so we
-// re-apply our overrides here. Returns nothing — best-effort.
-async function reconcileNewPrimary(ctx) {
-  const c = await findCNPGCluster(ctx);
-  if (!c) return;
-  const cnpgName = c.metadata.name;
-  const hasToken = !!c?.spec?.replica?.promotionToken;
-  if (hasToken) {
-    const r = await kubectl([
-      "--context", ctx, "-n", NAMESPACE,
-      "patch", "cluster.postgresql.cnpg.io", cnpgName,
-      "--type=json",
-      `-p=[{"op":"remove","path":"/spec/replica/promotionToken"}]`,
-    ]);
-    console.log(`[reconcile:${ctx}] cleared stale promotionToken on ${cnpgName} (code=${r.code})`);
-  }
-  const fastSync = JSON.stringify([
-    { op: "replace", path: "/spec/postgresql/synchronous/dataDurability", value: "preferred" },
-    { op: "replace", path: "/spec/postgresql/synchronous/standbyNamesPre", value: [] },
-    { op: "replace", path: "/spec/postgresql/synchronous/number", value: 1 },
-  ]);
-  const r2 = await kubectl([
-    "--context", ctx, "-n", NAMESPACE,
-    "patch", "cluster.postgresql.cnpg.io", cnpgName,
-    "--type=json", `-p=${fastSync}`,
-  ]);
-  console.log(`[reconcile:${ctx}] forced fast-write sync on ${cnpgName} (code=${r2.code})`);
-}
+app.post("/api/promote", withTopologyLock(createPromotionHandler({
+  getTopology: async () => {
+    const topology = membersFromDocument(await getDocumentDB(), MEMBER_CONTEXTS);
+    const clusters = await Promise.all(topology.members.map(async (context) =>
+      clusterStatus(context, await findCNPGCluster(context), topology.primary)));
+    return { ...topology, clusters };
+  },
+  checkHealth: checkReplicationHealthy,
+  kubectl,
+  invalidate: invalidatePrimaryCtxCache,
+  namespace: NAMESPACE,
+  resource: RESOURCE,
+  hubContext: HUB_CONTEXT,
+})));
 
-app.post("/api/promote", async (req, res) => {
-  const ctx = String(req.body?.context || req.body?.target || "");
-  if (!MEMBER_CONTEXTS.includes(ctx)) {
-    return res.status(400).json({ ok: false, error: `context must be one of ${MEMBER_CONTEXTS.join(", ")}` });
-  }
-  // Gate: refuse to promote if cross-cloud replication isn't healthy. Rapid
-  // back-to-back failovers on the preview operator cause WAL-timeline
-  // divergence that requires a full base-backup rebuild to fix.
-  // Caller can pass force=true (e.g. operator override) to bypass.
-  if (!req.body?.force) {
-    try {
-      const ddb = await getDocumentDB();
-      const primary = ddb.spec?.clusterReplication?.primary || null;
-      if (ctx === primary) {
-        return res.status(400).json({ ok: false, error: `${ctx} is already the primary` });
-      }
-      const clusters = await Promise.all(MEMBER_CONTEXTS.map(async (c) => {
-        const cnpg = await findCNPGCluster(c);
-        return {
-          context: c,
-          cnpgName: cnpg?.metadata?.name || null,
-          phase: cnpg?.status?.phase || null,
-          healthy: !!(cnpg?.status?.phase && /healthy/i.test(cnpg.status.phase)
-            && cnpg.status.readyInstances === cnpg.status.instances),
-          role: c === primary ? "PRIMARY" : "REPLICA",
-          currentPrimary: cnpg?.status?.currentPrimary || null,
-          promotionToken: !!cnpg?.spec?.replica?.promotionToken,
-        };
-      }));
-      const health = await checkReplicationHealthy(clusters);
-      if (!health.ok) {
-        return res.status(409).json({
-          ok: false,
-          error: `Replication is not healthy — refusing to promote. ${health.reason}`,
-          replicationHealthy: false,
-          reason: health.reason,
-          hint: "Wait for replica to fully catch up, or POST /api/rebuild-replica { context } to force a fresh base-backup.",
-        });
-      }
-    } catch (err) {
-      return res.status(500).json({ ok: false, error: `failover gate check failed: ${err.message || err}` });
-    }
-  }
-  const patch = JSON.stringify({ spec: { clusterReplication: { primary: ctx } } });
-  const out = await kubectl([
-    "--context", HUB_CONTEXT, "-n", NAMESPACE,
-    "patch", "documentdb", RESOURCE, "--type=merge", "-p", patch,
-  ]);
-  invalidatePrimaryCtxCache();
-  if (out.code === 0) {
-    // Background: reconcile + warm + heal-stale-token. The DocumentDB
-    // operator's cross-cloud promote handshake is unreliable on the preview
-    // operator (see issue documentdb/documentdb-kubernetes-operator#375): it
-    // races against itself and frequently leaves the new primary in
-    // "unrecoverable" with phaseReason "Promotion token content is not
-    // correct for current instance" because the token it stamped no longer
-    // matches the cluster's actual WAL position.
-    //
-    // We work around that by polling the new primary's CNPG state for up
-    // to ~3 minutes and, if we see the stale-token symptom, automatically
-    // running the same recovery the "Force-promote (local token)" button
-    // does: read this cluster's local promotion-token ConfigMap and stamp
-    // it onto spec.replica.promotionToken + replica.primary=self. CNPG
-    // then promotes pod-1 in place against its actual timeline.
-    (async () => {
-      try {
-        await new Promise((r) => setTimeout(r, 6000));
-        for (let i = 0; i < 4; i++) {
-          await reconcileNewPrimary(ctx).catch((e) => console.warn(`[reconcile:${ctx}] attempt ${i+1} failed: ${e.message || e}`));
-          await new Promise((r) => setTimeout(r, 4000));
-        }
-        await healStaleTokenIfNeeded(ctx);
-        // Proactive cleanup per research: even on a "clean" promote the
-        // operator leaves spec.replica.promotionToken set. Each subsequent
-        // reconcile re-validates it against an advancing pg_controldata, so
-        // it WILL go stale within minutes and trip #375 on the next cycle.
-        // Remove it now while we're healthy so the cluster stays stable.
-        await removeLingeringPromotionToken(ctx).catch((e) =>
-          console.warn(`[post-heal:${ctx}] token cleanup failed: ${e.message || e}`));
-        await getMongoDb(ctx);
-        await refreshListingsCache(ctx);
-        console.log(`[warm] re-primed mongo + listings cache for new primary ${ctx}`);
-      } catch (err) {
-        console.warn(`[warm] post-promote warm failed for ${ctx}: ${err.message || err}`);
-      }
-    })();
-  }
-  res.json({ ok: out.code === 0, stdout: out.stdout, stderr: out.stderr });
+app.use(["/api/clear-token", "/api/clear-stale-token", "/api/force-promote-local-token"], (_req, res, next) => {
+  if (LEGACY_RECOVERY) return next();
+  return res.status(409).json({ ok: false, error: "Legacy CNPG recovery is disabled for operator 1.0.0. Follow upstream recovery guidance; DDB_LEGACY_RECOVERY=true is only for the old preview demo." });
 });
 
 // Build a CNPG-compatible promotionToken JSON directly from the cluster's
@@ -453,106 +358,6 @@ async function buildPromotionTokenFromPgControl(ctx, cnpgName) {
   return Buffer.from(JSON.stringify(tokenObj), "utf8").toString("base64");
 }
 
-// Workaround for documentdb/documentdb-kubernetes-operator#375: after a
-// promote the operator may leave the new primary stuck in "unrecoverable"
-// with a stale promotionToken. Poll for that state for ~3 minutes and, if
-// detected, repeatedly stamp a freshly-built promotion token (sourced from
-// the cluster's own pg_control_checkpoint() — NOT the sidecar CM, which
-// can be stale or absent right after a rebuild) onto spec.replica until
-// CNPG accepts it and the cluster transitions to healthy.
-async function removeLingeringPromotionToken(ctx) {
-  const c = await findCNPGCluster(ctx).catch(() => null);
-  if (!c?.metadata?.name) return;
-  if (!c?.spec?.replica?.promotionToken) {
-    console.log(`[post-heal:${ctx}] no lingering promotionToken on ${c.metadata.name}`);
-    return;
-  }
-  const r = await kubectl([
-    "--context", ctx, "-n", NAMESPACE,
-    "patch", "cluster.postgresql.cnpg.io", c.metadata.name,
-    "--type=json",
-    `-p=[{"op":"remove","path":"/spec/replica/promotionToken"}]`,
-  ]);
-  if (r.code === 0) {
-    console.log(`[post-heal:${ctx}] removed lingering promotionToken from ${c.metadata.name}`);
-  } else {
-    console.warn(`[post-heal:${ctx}] token remove failed: ${r.stderr || r.stdout}`);
-  }
-}
-
-async function healStaleTokenIfNeeded(ctx) {
-  const deadline = Date.now() + 6 * 60 * 1000;
-  let cnpgName = null;
-  let healed = false;
-  let cycle = 0;
-  let healthyHits = 0; // require sustained healthy + writes work before exit
-  console.log(`[heal:${ctx}] starting (window=6min)`);
-  while (Date.now() < deadline) {
-    cycle++;
-    const c = await findCNPGCluster(ctx).catch(() => null);
-    if (!c?.metadata?.name) {
-      console.log(`[heal:${ctx}] cycle ${cycle}: no CNPG cluster yet, retrying`);
-      await new Promise((r) => setTimeout(r, 5000));
-      continue;
-    }
-    cnpgName = c.metadata.name;
-    const phase = c.status?.phase || "";
-    const reason = c.status?.phaseReason || "";
-    const isHealthy = /healthy/i.test(phase) && c.status?.readyInstances === c.status?.instances;
-    if (isHealthy) {
-      // The operator may stamp a bad promotionToken AFTER we first see
-      // "healthy" — exiting early lets that bug slip through. Require writes
-      // to actually succeed via the write probe before we declare done.
-      const probe = await checkWriteProbe(ctx).catch(() => ({ ok: false, reason: "probe error" }));
-      healthyHits = probe.ok ? healthyHits + 1 : 0;
-      console.log(`[heal:${ctx}] cycle ${cycle}: healthy phase, probe.ok=${probe.ok} (${probe.reason || `${probe.latencyMs}ms`}) hits=${healthyHits}`);
-      if (healthyHits >= 2) {
-        if (healed) console.log(`[heal:${ctx}] cycle ${cycle}: cluster healthy + writes confirmed after token heal — done`);
-        else console.log(`[heal:${ctx}] cycle ${cycle}: cluster healthy + writes confirmed — exit`);
-        return;
-      }
-      await new Promise((r) => setTimeout(r, 8000));
-      continue;
-    }
-    console.log(`[heal:${ctx}] cycle ${cycle}: phase="${phase}" reason="${reason}" ready=${c.status?.readyInstances}/${c.status?.instances}`);
-    healthyHits = 0;
-    if (/unrecoverable/i.test(phase) && /promotion token/i.test(reason)) {
-      // PER RESEARCH (.scratch/research-issue-375.md): the actual bug is that
-      // the operator never clears spec.replica.promotionToken after a
-      // successful promote. Each reconcile re-validates the token against
-      // pg_controldata which has advanced past it, eventually returning the
-      // non-retryable TokenVerificationError -> phase=Unrecoverable.
-      //
-      // The supported workaround (per issue #375 itself) is to REMOVE the
-      // token, not rebuild it. CNPG then stops re-validating and the cluster
-      // re-converges. Building a replacement token from pg_control is a red
-      // herring — even a perfectly-correct token will fall stale within
-      // seconds because the live primary keeps advancing the WAL.
-      try {
-        const r = await kubectl([
-          "--context", ctx, "-n", NAMESPACE,
-          "patch", "cluster.postgresql.cnpg.io", cnpgName,
-          "--type=json",
-          `-p=[{"op":"remove","path":"/spec/replica/promotionToken"}]`,
-        ]);
-        if (r.code === 0) {
-          healed = true;
-          console.log(`[heal:${ctx}] cycle ${cycle}: removed stale promotionToken from ${cnpgName} (issue #375 workaround)`);
-        } else if (/not found/i.test(r.stderr || "")) {
-          // Token already absent — nothing to remove. Cluster will converge on its own.
-          console.log(`[heal:${ctx}] cycle ${cycle}: no promotionToken present, waiting for cluster to converge`);
-        } else {
-          console.warn(`[heal:${ctx}] cycle ${cycle}: token-remove patch failed: ${r.stderr || r.stdout}`);
-        }
-      } catch (err) {
-        console.warn(`[heal:${ctx}] cycle ${cycle}: error: ${err.message || err}`);
-      }
-    }
-    await new Promise((r) => setTimeout(r, 10000));
-  }
-  console.warn(`[heal:${ctx}] gave up waiting for cluster to heal after 6 minutes`);
-}
-
 async function clearStaleTokenHandler(req, res) {
   const ctx = String(req.body?.context || "");
   if (!MEMBER_CONTEXTS.includes(ctx)) return res.status(400).json({ ok: false, error: "bad context" });
@@ -566,8 +371,8 @@ async function clearStaleTokenHandler(req, res) {
   ]);
   res.json({ ok: patched.code === 0, name: c.metadata.name, stdout: patched.stdout, stderr: patched.stderr });
 }
-app.post("/api/clear-token", clearStaleTokenHandler);
-app.post("/api/clear-stale-token", clearStaleTokenHandler);
+app.post("/api/clear-token", withTopologyLock(clearStaleTokenHandler));
+app.post("/api/clear-stale-token", withTopologyLock(clearStaleTokenHandler));
 
 // Force-promote a CNPG cluster using its OWN current promotion-token. This is
 // the recovery path for the failure mode where a failover left this side
@@ -585,7 +390,7 @@ app.post("/api/clear-stale-token", clearStaleTokenHandler);
 //
 // This is destructive at the topology level (it makes this cluster the
 // primary) so it requires confirmation from the UI.
-app.post("/api/force-promote-local-token", async (req, res) => {
+app.post("/api/force-promote-local-token", withTopologyLock(async (req, res) => {
   const ctx = String(req.body?.context || "");
   if (!MEMBER_CONTEXTS.includes(ctx)) {
     return res.status(400).json({ ok: false, error: `context must be one of ${MEMBER_CONTEXTS.join(", ")}` });
@@ -651,7 +456,7 @@ app.post("/api/force-promote-local-token", async (req, res) => {
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err.message || err) });
   }
-});
+}));
 
 // Rebuild a replica cluster from scratch by deleting its CNPG Cluster
 // resource. The DocumentDB hub operator reconciles within a few seconds and
@@ -754,19 +559,24 @@ function startRebuildWatcher(ctx, cnpgClusterName) {
   _rebuildWatchers.set(ctx, p);
 }
 
-app.post("/api/rebuild-replica", async (req, res) => {
+app.post("/api/rebuild-replica", withTopologyLock(async (req, res) => {
   const ctx = String(req.body?.context || "");
   if (!MEMBER_CONTEXTS.includes(ctx)) {
     return res.status(400).json({ ok: false, error: `context must be one of ${MEMBER_CONTEXTS.join(", ")}` });
   }
   try {
     const ddb = await getDocumentDB();
-    const primary = ddb.spec?.clusterReplication?.primary || null;
+    const { primary, members } = membersFromDocument(ddb, MEMBER_CONTEXTS);
+    if (!members.includes(ctx)) return res.status(400).json({ ok: false, error: "Context is not an active DocumentDB member" });
     if (ctx === primary) {
       return res.status(400).json({
         ok: false,
         error: `${ctx} is the current primary — refusing to wipe it. Promote the other cluster first if you really need to rebuild this one.`,
       });
+    }
+    const primaryCluster = await findCNPGCluster(primary);
+    if (!clusterStatus(primary, primaryCluster, primary).healthy || !primaryCluster.status?.currentPrimary) {
+      return res.status(409).json({ ok: false, error: "Current primary is not healthy; refusing to discard a replica" });
     }
     const c = await findCNPGCluster(ctx);
     if (!c?.metadata?.name) {
@@ -786,41 +596,33 @@ app.post("/api/rebuild-replica", async (req, res) => {
     // which then can't catch up to the new primary's forked timeline
     // (FATAL: requested starting point ... is not in this server's history).
     // Deleting PVCs forces a true pg_basebackup from the current primary.
-    kubectl([
+    const pvcDelete = await kubectl([
       "--context", ctx, "-n", NAMESPACE,
       "delete", "pvc", "-l", `cnpg.io/cluster=${c.metadata.name}`,
       "--wait=false", "--ignore-not-found",
-    ]).catch((err) => console.error(`[rebuild:${ctx}] PVC delete failed: ${err.message || err}`));
+    ]);
+    if (pvcDelete.code !== 0) return res.status(500).json({ ok: false, error: `CNPG deletion submitted but PVC deletion failed: ${pvcDelete.stderr}` });
     res.json({
       ok: true,
       cluster: c.metadata.name,
-      message: `Deleted CNPG cluster ${c.metadata.name} (and PVCs) in ${ctx}. The DocumentDB operator will re-bootstrap it from primary via pg_basebackup. Auto-healing watcher engaged for known cert-mismatch issue. Watch /api/status for progress.`,
+      message: `Deleted CNPG cluster ${c.metadata.name} (and PVCs) in ${ctx}. The DocumentDB operator will re-bootstrap it from primary via pg_basebackup. Watch /api/status for progress.`,
     });
     // Fire-and-forget background watcher that auto-recovers from the
     // post-rebuild cert-mismatch bug (see findings doc).
-    startRebuildWatcher(ctx, c.metadata.name);
+    if (LEGACY_RECOVERY) startRebuildWatcher(ctx, c.metadata.name);
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err.message || err) });
   }
-});
+}));
 
 // ---------- Primary-context cache ----------
 let _primaryCtxCache = { value: null, expiresAt: 0 };
 async function getGlobalPrimaryContext() {
   const now = Date.now();
   if (_primaryCtxCache.expiresAt > now && _primaryCtxCache.value) return _primaryCtxCache.value;
-  try {
-    const ddb = await getDocumentDB();
-    const v = ddb.spec?.clusterReplication?.primary || null;
-    _primaryCtxCache = { value: v, expiresAt: now + 300000 };
-    return v;
-  } catch (err) {
-    if (_primaryCtxCache.value) {
-      _primaryCtxCache.expiresAt = now + 30000;
-      return _primaryCtxCache.value;
-    }
-    throw err;
-  }
+  const { primary } = membersFromDocument(await getDocumentDB(), MEMBER_CONTEXTS);
+  _primaryCtxCache = { value: primary, expiresAt: now + 2000 };
+  return primary;
 }
 function invalidatePrimaryCtxCache() { _primaryCtxCache = { value: null, expiresAt: 0 }; }
 
@@ -1377,7 +1179,7 @@ app.post("/api/vector-search", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+if (require.main === module) app.listen(PORT, "127.0.0.1", () => {
   console.log(`DocumentDB monitor listening on http://localhost:${PORT}`);
   console.log(`Hub: ${HUB_CONTEXT}, members: ${MEMBER_CONTEXTS.join(", ")}, ns: ${NAMESPACE}, resource: ${RESOURCE}`);
   console.log(`Data demo target: db=${DEMO_DB}, listings=${LISTINGS_COLL}, bookings=${BOOKINGS_COLL}, gateway svc=${GATEWAY_SVC}:${GATEWAY_PORT}`);
@@ -1412,3 +1214,5 @@ app.listen(PORT, () => {
     })
     .catch((err) => console.warn(`[warm] primary context warm failed: ${err.message || err}`));
 });
+
+module.exports = { app };

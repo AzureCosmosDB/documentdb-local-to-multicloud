@@ -6,6 +6,62 @@ Complete setup instructions for the "From Localhost to Multi-Cloud" demo environ
 
 ## Prerequisites
 
+### Current release baseline and migration
+
+The demo pins DocumentDB operator/engine **1.0.0**, CNPG chart **0.28.3** (bundled
+by the operator), cert-manager **1.21.3**, Istio **1.30.7**, and
+kube-prometheus-stack **92.14.0**. Pins are centralized in `infra/versions.sh`.
+The monitor uses Node.js **24 LTS**, Express **5.3.0**, MongoDB driver **7.7.0**,
+and dotenv **18.0.8**, with committed npm lockfiles.
+
+Use Kubernetes **1.35+ with ImageVolume enabled** on every data-bearing member.
+The operator supports 1.33/1.34 only when the feature gate and runtime are
+explicitly available; managed clusters may not expose that option. The Fleet
+hub must meet the chart's 1.33+ floor. Do not select an unavailable version or
+region merely to satisfy the pin. Verify provider availability/quotas first.
+
+**Existing preview stacks are not automatically migrated.** Back up and verify
+restores, then follow the
+[operator 1.0 upgrade guide](https://documentdb.io/documentdb-kubernetes-operator/latest/preview/operations/upgrades/#upgrading-to-documentdb-10).
+From 0.3.0, pin each cluster's engine and remove `schemaVersion: auto` before
+upgrading the chart; the later extension/schema migration is irreversible.
+From the RC engine, use a fresh GA cluster and a supported data migration.
+The old copied `documentdb-base` operator placement is deliberately rejected by
+the new deployment script. For that preview demo, create a **new dedicated RG
+and stack**, migrate/verify data, and retire the old stack separately. Do not
+delete the old placement or PVCs as an improvised in-place migration.
+
+For a prepared non-legacy Helm installation, `ALLOW_OPERATOR_UPGRADE=true`
+explicitly permits a chart version change; it is not a schema-migration tool.
+`deploy-documentdb.sh` refuses an in-place engine-version change.
+
+The local Docker image is pinned by tag and digest to `pg18-1.0.0`; do not reuse
+an older PostgreSQL data directory without a supported data migration.
+The ignored `data/listings_vectors.json` must be supplied locally for the seed
+and vector-search demos; a fresh Git checkout does not contain that dataset.
+
+### kubectl plugin
+
+The plugin runs on the presenter's machine. Helm does **not** install a local
+kubectl plugin. Build it from the same published operator release, using Git
+and a compatible Go toolchain:
+
+```bash
+# Separate reference checkout; do not overwrite an existing operator checkout.
+git clone --branch 1.0.0 --depth 1 \
+  https://github.com/documentdb/documentdb-kubernetes-operator.git documentdb-operator-1.0.0
+cd documentdb-operator-1.0.0/documentdb-kubectl-plugin
+# Linux/macOS:
+go build -o "$HOME/bin/kubectl-documentdb" .
+# Windows Git Bash instead:
+# go build -o "$HOME/bin/kubectl-documentdb.exe" .
+kubectl documentdb promote --help
+```
+
+Create `$HOME/bin` first if needed and add it to PATH. The monitor uses planned
+promotion without `--failover`. A failed/unreachable old primary requires the
+upstream disaster-recovery procedure and a separate data-loss decision.
+
 ### Tools Required
 
 | Tool | Purpose | Install |
@@ -24,7 +80,7 @@ Complete setup instructions for the "From Localhost to Multi-Cloud" demo environ
 ### Cloud Accounts
 
 - **Azure subscription** with Contributor access
-- **AWS account** with IAM permissions for EKS, EBS, and Load Balancer
+- **AWS account** with IAM permissions for EKS, EBS, and Load Balancer (only if EKS is enabled)
 
 #### AWS authentication
 
@@ -101,6 +157,12 @@ python scripts/vector_restaurants_demo.py --query "romantic Italian dinner" --mo
 
 ### Phase 3: Multi-cloud (AKS Fleet + AKS member + EKS member)
 
+For two regional AKS members instead of EKS, export `INCLUDE_EKS=false`,
+`INCLUDE_AKS_REPLICA=true`, and `AKS_REPLICA_REGION=<second-region>` before the
+commands below, and skip `aws sso login`. Keep those settings for all scripts.
+Leave EKS enabled for a three-member demo. See the
+[complete topology configuration](infra/multi-cloud/README.md).
+
 The talk uses the upstream `documentdb-playground/multi-cloud-deployment`
 setup vendored into `infra/multi-cloud/`. It gives **real cross-cloud
 replication** — one DocumentDB CR, propagated to both clusters by KubeFleet,
@@ -114,8 +176,9 @@ aws sso login
 # Stand up Fleet hub + AKS + EKS + Istio + operator (~25-35 min)
 bash infra/multi-cloud/deploy.sh
 
-# Deploy DocumentDB across the mesh (auto-generates a password; save it)
+# Deploy DocumentDB across the mesh (password retained in a Kubernetes Secret)
 bash infra/multi-cloud/deploy-documentdb.sh
+bash monitoring/deploy.sh
 ```
 
 ### Phase 3b: Load the demo dataset
@@ -156,9 +219,9 @@ This will:
 3. Create EKS cluster `aws-documentdb` in `us-west-2` via eksctl, with EBS CSI driver and AWS LB controller
 4. Join EKS to the AKS Fleet via the kubefleet bootstrap
 5. Install cert-manager on every cluster
-6. Install Istio 1.24 multi-cluster mesh with shared root CA + east-west gateways + cross-cluster remote secrets
+6. Install pinned Istio Helm charts with shared root CA + east-west gateways + cross-cluster remote secrets
 7. Annotate the EKS east-west gateway with internet-facing NLB tags
-8. Install the DocumentDB operator on the hub; propagate CRDs/RBAC to members via `ClusterResourcePlacement`
+8. Install the published operator independently on the hub and each member (no copied webhook certificates)
 9. (`deploy-documentdb.sh`) Apply the `DocumentDB` CR + propagation policy; AKS becomes the primary, EKS becomes the WAL replica
 
 **Estimated time:** 25-35 minutes for `deploy.sh`, ~5 minutes for `deploy-documentdb.sh`
@@ -176,6 +239,8 @@ Once both clouds are deployed and `kubectl --context azure-documentdb` /
 ```powershell
 # From PowerShell (Windows)
 .\start.ps1
+# Azure-only variant:
+# .\start.ps1 -MemberContexts azure-documentdb,azure-documentdb-secondary
 ```
 
 ```cmd
